@@ -1,0 +1,450 @@
+<script>
+(function() {
+  'use strict';
+  
+  var BONUS_ACCRUAL_API_URL = "https://duu98ifeda.execute-api.eu-north-1.amazonaws.com/prod/bonus-accrual";
+  var BONUS_PERCENTAGE = 0.10;
+  
+  function getOrderNumber() {
+    var invoiceRows = document.querySelectorAll('.invoice__item');
+    
+    for (var i = 0; i < invoiceRows.length; i++) {
+      var nameCell = invoiceRows[i].querySelector('.invoice__name'); 
+      var valueCell = invoiceRows[i].querySelector('.invoice__value');
+      
+      if (nameCell && valueCell) {
+        var nameText = nameCell.textContent || nameCell.innerText;
+        var valueText = valueCell.textContent || valueCell.innerText;
+        
+        if (nameText.toLowerCase().includes('замовлення') || nameText.toLowerCase().includes('заказ')) {
+          var orderMatch = valueText.match(/(\d+)/);
+          if (orderMatch) {
+            return orderMatch[1];
+          }
+        }
+      }
+    }
+    
+    var orderHeaders = document.querySelectorAll('.h2');
+    
+    for (var i = 0; i < orderHeaders.length; i++) {
+      var text = orderHeaders[i].textContent || orderHeaders[i].innerText;
+      var match = text.match(/Замовлення\s*№(\d+)/i);
+      if (match) {
+        return match[1];
+      }
+    }
+    
+    var orderElements = document.querySelectorAll('[id*="order"], [class*="order"]');
+    
+    for (var i = 0; i < orderElements.length; i++) {
+      var text = orderElements[i].textContent || orderElements[i].innerText;
+      var match = text.match(/№(\d+)/);
+      if (match) {
+        return match[1];
+      }
+    }
+    
+    return null;
+  }
+  
+  function getOrderTotal() {
+    var mobileTotal = document.querySelector('.order-details__total');
+    
+    if (mobileTotal) {
+      var text = mobileTotal.textContent || mobileTotal.innerText;
+      var cleanText = text.replace(/[^\d.,]/g, '').replace(',', '.');
+      var amount = parseFloat(cleanText);
+      
+      if (!isNaN(amount) && amount > 0) {
+        return amount;
+      }
+    }
+    
+    var totalSelectors = [
+      '.order-summary-b',
+      '.order-total',
+      '.checkout-total',
+      '.summary-total'
+    ];
+    
+    for (var i = 0; i < totalSelectors.length; i++) {
+      var selector = totalSelectors[i];
+      var element = document.querySelector(selector);
+      
+      if (element) {
+        var text = element.textContent || element.innerText;
+        var cleanText = text.replace(/[^\d.,]/g, '').replace(',', '.');
+        var amount = parseFloat(cleanText);
+        
+        if (!isNaN(amount) && amount > 0) {
+          return amount;
+        }
+      }
+    }
+    
+    return null;
+  }
+  
+  function getCustomerData() {
+    var customerData = {};
+    
+    var invoiceItems = document.querySelectorAll('.invoice__item');
+    
+    for (var i = 0; i < invoiceItems.length; i++) {
+      var nameElement = invoiceItems[i].querySelector('.invoice__name');
+      var valueElement = invoiceItems[i].querySelector('.invoice__value');
+      
+      if (nameElement && valueElement) {
+        var nameText = nameElement.textContent || nameElement.innerText;
+        var valueText = valueElement.textContent || valueElement.innerText;
+        
+        nameText = nameText.toLowerCase();
+        if (nameText.includes("ім'я") || nameText.includes("прізвище") || nameText.includes("покупець")) {
+          customerData.name = valueText.trim();
+        } else if (nameText.includes("е-пошта") || nameText.includes("email") || nameText.includes("пошта")) {
+          customerData.email = valueText.trim();
+        } else if (nameText.includes("телефон") || nameText.includes("тел.")) {
+          customerData.phone = valueText.trim();
+        }
+      }
+    }
+    
+    if (!customerData.name && !customerData.email && !customerData.phone) {
+      var customerBlock = document.querySelector('#order-customer-data');
+      
+      if (customerBlock) {
+        var items = customerBlock.querySelectorAll('dt.check-h');
+        
+        for (var i = 0; i < items.length; i++) {
+          var label = items[i].textContent || items[i].innerText;
+          var valueElement = items[i].nextElementSibling;
+          
+          if (valueElement && valueElement.classList.contains('check-b')) {
+            var value = valueElement.textContent || valueElement.innerText;
+            
+            if (label.includes("Ім'я") || label.includes("прізвище")) {
+              customerData.name = value.trim();
+            } else if (label.includes("Е-пошта") || label.includes("email")) {
+              customerData.email = value.trim();
+            } else if (label.includes("Телефон")) {
+              customerData.phone = value.trim();
+            }
+          }
+        }
+      }
+    }
+    
+    return customerData;
+  }
+  
+  function getUsedBonusAmount() {
+    // Селектори для пошуку використаних бонусів
+    var bonusSelectors = [
+      '.order-details__cost-value', // Мобільна версія
+      '.order-details-b'            // Десктопна версія
+    ];
+    
+    for (var i = 0; i < bonusSelectors.length; i++) {
+      var elements = document.querySelectorAll(bonusSelectors[i]);
+      
+      for (var j = 0; j < elements.length; j++) {
+        var element = elements[j];
+        var text = element.textContent || element.innerText;
+        
+        // Шукаємо текст що починається з мінуса (знак списання)
+        if (text && text.trim().startsWith('–') || text.trim().startsWith('-')) {
+          // Витягуємо число з тексту
+          var bonusMatch = text.match(/[–-]\s*(\d+(?:[.,]\d+)?)/);
+          if (bonusMatch) {
+            var usedAmount = parseFloat(bonusMatch[1].replace(',', '.'));
+            if (!isNaN(usedAmount) && usedAmount > 0) {
+              return usedAmount;
+            }
+          }
+        }
+      }
+    }
+    
+    return 0;
+  }
+  
+  function processBonusOperation(orderData) {
+    return new Promise(function(resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', BONUS_ACCRUAL_API_URL, true);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      
+      xhr.onreadystatechange = function() {
+        if (xhr.readyState === 4) {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              var response = JSON.parse(xhr.responseText);
+              resolve(response);
+            } catch (e) {
+              reject(new Error('Помилка парсингу відповіді'));
+            }
+          } else {
+            reject(new Error('Помилка сервера: ' + xhr.status));
+          }
+        }
+      };
+      
+      xhr.onerror = function() {
+        reject(new Error('Помилка мережі'));
+      };
+      
+      xhr.send(JSON.stringify(orderData));
+    });
+  }
+  
+  function showBonusNotification(operationData) {
+    var bonusAmount = operationData.bonusAmount || 0;
+    var usedAmount = operationData.usedBonusAmount || 0;
+    var isCombo = bonusAmount > 0 && usedAmount > 0;
+    var isOnlyDeduction = usedAmount > 0 && bonusAmount === 0;
+    var isOnlyAccrual = bonusAmount > 0 && usedAmount === 0;
+    
+    var notification = document.createElement('div');
+    notification.style.cssText = 
+      'background: linear-gradient(135deg, #16a085, #1abc9c);' +
+      'color: white;' +
+      'padding: 15px;' +
+      'margin: 15px auto;' +
+      'border-radius: 8px;' +
+      'text-align: center;' +
+      'font-size: 14px;' +
+      'box-shadow: 0 4px 12px rgba(22, 160, 133, 0.3);' +
+      'animation: slideIn 0.5s ease-out;' +
+      'max-width: 100%;' +
+      'box-sizing: border-box;' +
+      'position: relative;' +
+      'z-index: 1000;';
+    
+    var titleText = '';
+    var detailsText = '';
+    
+    if (isCombo) {
+      titleText = '🎁 Операції з бонусами виконані!';
+      detailsText = 
+        '<div style="font-size: 15px; font-weight: bold; margin-bottom: 8px;">' +
+          'Списано: <strong>-' + usedAmount + '</strong> бонусів | ' +
+          'Нараховано: <strong>+' + bonusAmount + '</strong> бонусів' +
+        '</div>' +
+        '<div style="font-size: 13px; opacity: 0.9;">' +
+          'Підсумок: ' + (bonusAmount - usedAmount > 0 ? '+' : '') + (bonusAmount - usedAmount) + ' бонусів до балансу' +
+        '</div>';
+    } else if (isOnlyDeduction) {
+      titleText = '💸 Бонуси використані!';
+      detailsText = 
+        '<div style="font-size: 15px; font-weight: bold;">Списано <strong>' + usedAmount + '</strong> бонусів</div>' +
+        '<div style="font-size: 12px; margin-top: 8px; opacity: 0.9;">' +
+          'Дякуємо за використання бонусної програми!' +
+        '</div>';
+    } else if (isOnlyAccrual) {
+      titleText = '🎁 Вітаємо! Вам нараховано бонуси!';
+      detailsText = 
+        '<div style="font-size: 15px; font-weight: bold;">За це замовлення ви отримали <strong>' + bonusAmount + '</strong> бонусів</div>' +
+        '<div style="font-size: 12px; margin-top: 8px; opacity: 0.9;">' +
+          'Бонуси можна використати при наступному замовленні' +
+        '</div>';
+    }
+    
+    notification.innerHTML = 
+      '<div style="display: flex; align-items: center; justify-content: center; margin-bottom: 10px; flex-wrap: wrap;">' +
+        '<span style="font-size: 20px; margin-right: 8px;">' + (isOnlyDeduction ? '💸' : '🎁') + '</span>' +
+        '<strong style="font-size: 16px;">' + titleText + '</strong>' +
+      '</div>' +
+      detailsText;
+    
+    var style = document.createElement('style');
+    style.textContent = 
+      '@keyframes slideIn {' +
+        'from { opacity: 0; transform: translateY(-20px); }' +
+        'to { opacity: 1; transform: translateY(0); }' +
+      '}' +
+      '@media (max-width: 768px) {' +
+        'div[style*="background: linear-gradient(135deg, #16a085, #1abc9c)"] {' +
+          'margin: 10px !important;' +
+          'padding: 12px !important;' +
+          'font-size: 13px !important;' +
+        '}' +
+      '}';
+    document.head.appendChild(style);
+    
+    var insertionPoint = null;
+    
+    var сontainers = [
+      '.invoice',
+      '#order-customer-data'
+    ];
+    
+    for (var i = 0; i < сontainers.length; i++) {
+      var container = document.querySelector(сontainers[i]);
+      if (container) {
+        insertionPoint = container;
+        break;
+      }
+    }
+    
+    if (insertionPoint) {
+      insertionPoint.parentNode.insertBefore(notification, insertionPoint.nextSibling);
+    } else {
+      document.body.appendChild(notification);
+    }
+  }
+  
+  function isAlreadyProcessed(orderId) {
+    try {
+      var processed = localStorage.getItem('bonusProcessed_' + orderId);
+      return processed === 'true';
+    } catch (e) {
+      return false;
+    }
+  }
+  
+  function markAsProcessed(orderId) {
+    try {
+      localStorage.setItem('bonusProcessed_' + orderId, 'true');
+    } catch (e) {
+    }
+  }
+  
+  function shouldShowNotification(orderId) {
+    // Завжди показуємо повідомлення на сторінці подяки
+    return true;
+  }
+  
+  function getStoredBonusData(orderId) {
+    try {
+      var storedData = localStorage.getItem('bonusData_' + orderId);
+      return storedData ? JSON.parse(storedData) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  
+  function storeBonusData(orderId, bonusData) {
+    try {
+      localStorage.setItem('bonusData_' + orderId, JSON.stringify(bonusData));
+    } catch (e) {
+    }
+  }
+
+  function processBonusAccrual() {
+    var currentUrl = window.location.href;
+    var isCheckoutCompletePage = currentUrl.includes('checkout/complete');
+    
+    if (!isCheckoutCompletePage) {
+      return;
+    }
+    
+    var orderId = getOrderNumber();
+    var orderTotal = getOrderTotal();
+    var customerData = getCustomerData();
+    var usedBonusAmount = getUsedBonusAmount();
+    
+    if (!orderId) {
+      return;
+    }
+    
+    if (!orderTotal) {
+      return;
+    }
+    
+    if (!customerData.phone && !customerData.email) {
+      return;
+    }
+    
+    var bonusAmount = Math.floor(orderTotal * BONUS_PERCENTAGE);
+    
+    var hasAccrual = bonusAmount > 0;
+    var hasDeduction = usedBonusAmount > 0;
+    
+    if (!hasAccrual && !hasDeduction) {
+      return;
+    }
+    
+    // Перевіряємо чи є збережені дані про бонуси
+    var storedBonusData = getStoredBonusData(orderId);
+    
+    if (storedBonusData) {
+      // Якщо є збережені дані, показуємо повідомлення на основі них
+      showBonusNotification(storedBonusData);
+      return;
+    }
+    
+    // Перевіряємо чи операція вже була виконана
+    if (isAlreadyProcessed(orderId)) {
+      // Якщо операція була виконана, але немає збережених даних про показ,
+      // показуємо повідомлення на основі поточних даних
+      var notificationData = {
+        bonusAmount: hasAccrual ? bonusAmount : 0,
+        usedBonusAmount: hasDeduction ? usedBonusAmount : 0
+      };
+      showBonusNotification(notificationData);
+      storeBonusData(orderId, notificationData);
+      return;
+    }
+    
+    var requestData = {
+      orderId: orderId,
+      orderTotal: orderTotal,
+      customer: {
+        name: customerData.name || '',
+        phone: customerData.phone || '',
+        email: customerData.email || ''
+      },
+      timestamp: new Date().toISOString(),
+      source: 'thank_you_page'
+    };
+    
+    if (hasAccrual) {
+      requestData.bonusAmount = bonusAmount;
+    }
+    
+    if (hasDeduction) {
+      requestData.usedBonusAmount = usedBonusAmount;
+    }
+    
+    processBonusOperation(requestData)
+      .then(function(response) {
+        markAsProcessed(orderId);
+        
+        var notificationData = {
+          bonusAmount: hasAccrual ? bonusAmount : 0,
+          usedBonusAmount: hasDeduction ? usedBonusAmount : 0
+        };
+        
+        storeBonusData(orderId, notificationData);
+        showBonusNotification(notificationData);
+      })
+      .catch(function(error) {
+        // Навіть у випадку помилки показуємо повідомлення про те, що мало б бути
+        var notificationData = {
+          bonusAmount: hasAccrual ? bonusAmount : 0,
+          usedBonusAmount: hasDeduction ? usedBonusAmount : 0
+        };
+        
+        storeBonusData(orderId, notificationData);
+        showBonusNotification(notificationData);
+      });
+  }
+  
+  var currentUrl = window.location.href;
+  var isValidPage = currentUrl.includes('checkout/complete');
+  
+  if (!isValidPage) {
+    return;
+  }
+  
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function() {
+      processBonusAccrual(); // Прибираємо затримку
+    });
+  } else {
+    processBonusAccrual(); // Прибираємо затримку
+  }
+  
+})();
+</script>

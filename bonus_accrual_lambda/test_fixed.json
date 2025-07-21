@@ -1,0 +1,9 @@
+{
+    "httpMethod": "POST",
+    "path": "/",
+    "queryStringParameters": null,
+    "body": "{\"orderId\":\"34841\",\"orderTotal\":4115,\"bonusAmount\":411,\"usedBonusAmount\":0,\"customer\":{\"phone\":\"+38 (066) 666-66-66\",\"email\":\"test@gmail.com\",\"name\":\"test\"}}",
+    "headers": {
+        "Content-Type": "application/json"
+    }
+}
