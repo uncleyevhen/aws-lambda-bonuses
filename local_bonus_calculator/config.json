@@ -1,0 +1,19 @@
+{
+  "api_key": "M2IyOTFjNWM4ODA2OWU0NjU4ZDRkODAxZDVkMTQ4ZGNlMzUzYzc5NQ",
+  "bonus_percentage": 7.0,
+  "description": "Конфігурація з ротаційним проксі WebShare для обходу rate limiting",
+  "note": "Використовуються UUID полів з Lambda функції: CT_1023 (Бонусні бали), CT_1033 (Історія бонусів), CT_1024 (Дата закінчення)",
+  "search_mode": {
+    "enabled": true,
+    "only_search": true,
+    "min_bonus_amount": 3000,
+    "description": "enabled: увімкнути пошук клієнтів, only_search: тільки пошук без нарахування, min_bonus_amount: мінімальна кількість бонусів для пошуку"
+  },
+  "proxy": {
+    "enabled": true,
+    "host": "p.webshare.io",
+    "port": 80,
+    "username": "oxfvxmgn-UA-rotate",
+    "password": "drciz7b4squj"
+  }
+}

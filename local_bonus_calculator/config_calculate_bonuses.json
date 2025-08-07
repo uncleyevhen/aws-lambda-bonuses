@@ -1,0 +1,18 @@
+{
+  "api_key": "M2IyOTFjNWM4ODA2OWU0NjU4ZDRkODAxZDVkMTQ4ZGNlMzUzYzc5NQ",
+  "bonus_percentage": 7.0,
+  "description": "ЗВИЧАЙНИЙ РЕЖИМ: нарахування бонусів всім клієнтам",
+  "search_mode": {
+    "enabled": false,
+    "only_search": false,
+    "min_bonus_amount": 3000,
+    "description": "Стандартне нарахування бонусів без пошуку"
+  },
+  "proxy": {
+    "enabled": true,
+    "host": "p.webshare.io",
+    "port": 80,
+    "username": "oxfvxmgn-UA-rotate",
+    "password": "drciz7b4squj"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "api_key": "M2IyOTFjNWM4ODA2OWU0NjU4ZDRkODAxZDVkMTQ4ZGNlMzUzYzc5NQ",
+  "newsletter_funnel_id": 15,
+  "auto_delete_duplicates": true,
+  "duplicate_status_id": 257,
+  "proxy": {
+    "enabled": true,
+    "host": "p.webshare.io",
+    "port": 80,
+    "username": "oxfvxmgn-UA-rotate",
+    "password": "drciz7b4squj"
+  }
+}

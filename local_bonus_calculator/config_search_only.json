@@ -1,0 +1,18 @@
+{
+  "api_key": "M2IyOTFjNWM4ODA2OWU0NjU4ZDRkODAxZDVkMTQ4ZGNlMzUzYzc5NQ",
+  "bonus_percentage": 7.0,
+  "description": "РЕЖИМ ПОШУКУ: тільки збір інформації про клієнтів з великими бонусами",
+  "search_mode": {
+    "enabled": true,
+    "only_search": true,
+    "min_bonus_amount": 3000,
+    "description": "Шукає клієнтів з бонусами ≥ min_bonus_amount, НЕ нараховує нові бонуси"
+  },
+  "proxy": {
+    "enabled": true,
+    "host": "p.webshare.io",
+    "port": 80,
+    "username": "oxfvxmgn-UA-rotate",
+    "password": "drciz7b4squj"
+  }
+}

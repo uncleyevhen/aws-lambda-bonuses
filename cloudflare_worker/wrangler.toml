@@ -1,0 +1,24 @@
+name = "bonus-worker"
+main = "bonus_worker.js"
+compatibility_date = "2024-08-07"
+
+[env.production.vars]
+BONUS_BALANCE_API_URL = "https://your-actual-api.com/balance"
+PROMO_API_URL = "https://your-actual-api.com/promo"
+ACTUAL_BALANCE_API = "https://s3qqv47ka3.execute-api.eu-north-1.amazonaws.com/prod"
+ACTUAL_PROMO_API = "https://o723fjnt6i.execute-api.eu-north-1.amazonaws.com"
+API_TOKEN = "your-secret-token"
+
+[env.development.vars]
+BONUS_BALANCE_API_URL = "https://staging-api.com/balance"
+PROMO_API_URL = "https://staging-api.com/promo"
+ACTUAL_BALANCE_API = "https://staging.api.com"
+ACTUAL_PROMO_API = "https://staging.api.com"
+API_TOKEN = "staging-token"
+
+# Custom domain configuration
+[[env.production.routes]]
+pattern = "bonus-api.yourdomain.com/*"
+
+[[env.development.routes]]
+pattern = "staging-bonus.yourdomain.com/*"

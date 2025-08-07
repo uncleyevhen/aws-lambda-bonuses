@@ -1,0 +1,13 @@
+{
+  "Variables": {
+    "ADMIN_URL": "https://safeyourlove.com/edit/discounts/codes",
+    "ADMIN_USERNAME": "owner",
+    "ADMIN_PASSWORD": "sdjkdfsf4ir2rfkb",
+    "PLAYWRIGHT_BROWSERS_PATH": "/opt/playwright-browsers",
+    "LOG_LEVEL": "INFO",
+    "REGION": "eu-north-1",
+    "SESSION_S3_BUCKET": "lambda-promo-sessions",
+    "PROMO_CODES_S3_KEY": "promo-codes/available_codes.json",
+    "USED_CODES_S3_KEY": "promo-codes/used_codes_count.json"
+  }
+}

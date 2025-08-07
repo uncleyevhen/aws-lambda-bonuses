@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
 """
-СМАРТ генератор промокодів з фільтрацією та аналізом існуючих кодів.
+СМАРТ генератор промокодів з фільтрацією та аналізом існуючих кодів (ПАРАЛЕЛЬНИЙ РЕЖИМ).
 
 ОСНОВНІ ФУНКЦІЇ:
-1. smart_promo_management_main() - ГОЛОВНА ФУНКЦІЯ для автоматичного управління промокодами
-2. apply_amount_filter_improved() / apply_code_filter_improved() - фільтрація в адмін-панелі  
-3. get_all_bon_codes_from_table() - збір всіх BON кодів з таблиці з підтримкою пагінації
-4. generate_codes_for_amount() / create_codes_for_amount() - генерація та створення кодів
-5. delete_specific_promo_codes() - видалення конкретних промокодів
-6. upload_to_s3() / download_from_s3() - синхронізація з S3
+1. manage_promo_codes() - ГОЛОВНА ФУНКЦІЯ для паралельного управління промокодами
+2. worker_process() - робочий процес для обробки діапазону сум
+3. smart_promo_management_worker() - логіка обробки для кожного процесу
+4. apply_amount_filter() / apply_code_filter() - фільтрація в адмін-панелі  
+5. get_all_bon_codes_with_pagination() - збір всіх BON кодів з таблиці з підтримкою пагінації
+6. generate_promo_codes() / create_promo_codes() - генерація та створення кодів
+7. delete_specific_promo_codes() - видалення конкретних промокодів
+8. upload_to_s3() / download_from_s3() - синхронізація з S3
+
+ПАРАЛЕЛЬНИЙ РЕЖИМ:
+- Автоматично розділяє діапазон сум між процесами
+- Кількість процесів налаштовується через CONFIG['parallel_processes']
+- Кожен процес обробляє свій діапазон незалежно
+- Результати збираються та записуються в S3
 
 ЗАПУСК:
 - HEADLESS режим: PLAYWRIGHT_HEADED=false python3 promo_generator.py  
 - HEADED режим (за замовчуванням): python3 promo_generator/promo_generator.py
 
-ОНОВЛЕННЯ v2.5:
-- Видалено невикористовувані функції для оптимізації коду
-- Залишено лише активно використовувані функції
-- Покращено читабельність і зменшено розмір файлу
+НАЛАШТУВАННЯ ПАРАЛЕЛЬНОСТІ:
+- Через змінну середовища: PROMO_PARALLEL_PROCESSES=5
+- Або в CONFIG['parallel_processes']
+
+ОНОВЛЕННЯ v3.0:
+- Видалено не паралельний режим
+- Залишено тільки паралельну обробку
+- Спрощено архітектуру
 """
 
+from typing import Any, Dict, List, Optional, Set
 import boto3
 import json
 import random
@@ -31,12 +44,7 @@ import sys
 import re
 import datetime
 import multiprocessing
-import importlib
-import importlib.util
-import inspect
-from multiprocessing import Process, Queue, Manager
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Process, Queue
 from dotenv import load_dotenv
 
 # Додаємо шлях до replenish_promo_code_lambda для імпорту
@@ -45,10 +53,11 @@ sys.path.insert(0, os.path.join(parent_dir, 'replenish_promo_code_lambda'))
 
 # Імпорти для браузера та логіну (з обробкою помилок)
 try:
-    from browser_manager import create_browser_manager
-    from promo_logic import PromoService
+    from bonus_system.bonus_replenish_promo_code.browser_manager import create_browser_manager
+    from bonus_system.bonus_replenish_promo_code.promo_logic import PromoService
     BROWSER_MODULES_AVAILABLE = True
 except ImportError as e:
+    # Створюємо logger, якщо він ще не ініціалізований
     logger = logging.getLogger(__name__)
     logger.warning(f"⚠️ Не вдалося імпортувати браузерні модулі: {e}")
     create_browser_manager = None
@@ -58,33 +67,38 @@ except ImportError as e:
 # Завантажуємо змінні середовища з .env файлу
 load_dotenv()
 
-# --- Основна конфігурація ---
+# Ініціалізуємо глобальний logger
+logger = logging.getLogger(__name__)
+
+# --- Конфігурація паралельного режиму ---
 CONFIG = {
     's3_bucket': 'lambda-promo-sessions',
     's3_key': 'promo-codes/available_codes.json',
     'region': 'eu-north-1',
-    'target_codes_per_amount': 10,
-    'start_amount': 1,
-    'end_amount': 1000,  # Діапазон до 100
+    'target_codes_per_amount': 5,
+    'start_amount': 1,      # Початкова сума для обробки
+    'end_amount': 2000,        # Кінцева сума для обробки
     'sort_order': 'asc',  # Порядок сортування: 'asc' (зростання) або 'desc' (спадання)
-    'sync_s3': True,
-    'auto_delete_excess': True,  # Увімкнемо видалення для тестування
-    'verbose_logging': False,  # Додано для контролю детального логування
+    'sync_s3': True,     # Синхронізація з S3
+    'auto_delete_excess': False,  # Автоматичне видалення зайвих промокодів
+    'delete_existing_before_add': False,  # Видалення всіх існуючих промокодів перед додаванням нових
+    'verbose_logging': True,     # Детальне логування
     'quick_mode': True,  # Швидкий режим - мінімум логів для оптимальних випадків
-    'parallel_processes': 10,  # Встановлюємо 2 процеси для тестування паралельності
+    'parallel_processes': 3,    # Кількість паралельних процесів
     'process_timeout': 600,  # Таймаут для процесу в секундах (10 хвилин)
 }
 
 # Налаштування кількості процесів через змінні середовища
 def get_processes_count():
-    """Отримує кількість процесів із змінних середовища або конфігурації."""
+    """Отримує кількість процесів із змінних середовища або конфігурації.
+    Мінімум 2 процеси для паралельного режиму."""
     env_processes = os.getenv('PROMO_PARALLEL_PROCESSES')
     if env_processes:
         try:
-            return max(1, int(env_processes))
+            return max(2, int(env_processes))  # Мінімум 2 процеси
         except ValueError:
             pass
-    return CONFIG.get('parallel_processes', 1)
+    return max(2, CONFIG.get('parallel_processes', 5))  # Мінімум 2 процеси
 
 # Оновлюємо конфігурацію
 CONFIG['parallel_processes'] = get_processes_count()
@@ -103,12 +117,16 @@ def split_range_for_processes(start_amount, end_amount, num_processes):
     Returns:
         list: список кортежів (start, end) для кожного процесу
     """
+    logger.info(f"🔍 Розділення діапазону {start_amount}-{end_amount} на {num_processes} процесів")
+    
     total_range = end_amount - start_amount + 1
     chunk_size = total_range // num_processes
     remainder = total_range % num_processes
     
     ranges = []
     current_start = start_amount
+    
+    logger.info(f"📊 Загальний діапазон: {total_range}, розмір блоку: {chunk_size}, остача: {remainder}")
     
     for i in range(num_processes):
         # Додаємо по одному до розміру chunks, якщо є остача
@@ -119,12 +137,15 @@ def split_range_for_processes(start_amount, end_amount, num_processes):
         current_end = min(current_end, end_amount)
         
         ranges.append((current_start, current_end))
+        logger.debug(f"  🧩 Процес {i+1}: діапазон {current_start}-{current_end} ({current_chunk_size} сум)")
+        
         current_start = current_end + 1
         
         # Якщо досягли кінця, зупиняємось
         if current_start > end_amount:
             break
     
+    logger.info(f"✅ Розділення завершено. Створено {len(ranges)} діапазонів")
     return ranges
 
 def worker_process(process_id, start_amount, end_amount, result_queue, config_override=None):
@@ -184,6 +205,9 @@ def worker_process(process_id, start_amount, end_amount, result_queue, config_ov
         process_logger.info(f"✅ Процес {process_id} завершено успішно")
         
     except Exception as e:
+        # Створюємо process_logger, якщо він не був створений
+        process_logger = logging.getLogger(f'worker_{process_id}')
+        
         error_result = {
             'process_id': process_id,
             'start_amount': start_amount,
@@ -195,10 +219,7 @@ def worker_process(process_id, start_amount, end_amount, result_queue, config_ov
         }
         result_queue.put(error_result)
         
-        if 'process_logger' in locals():
-            process_logger.error(f"❌ Помилка в процесі {process_id}: {e}")
-        else:
-            print(f"❌ Помилка в процесі {process_id}: {e}")
+        process_logger.error(f"❌ Помилка в процесі {process_id}: {e}")
 
 def smart_promo_management_worker(process_id, config, process_logger):
     """
@@ -212,6 +233,10 @@ def smart_promo_management_worker(process_id, config, process_logger):
     Returns:
         dict: результати роботи процесу
     """
+    # Встановлюємо глобальний logger для сумісності з функціями, що його використовують
+    global logger
+    logger = process_logger
+    
     process_logger.info(f"🔧 Робочий процес {process_id} розпочав роботу")
     
     # Імпорти
@@ -228,59 +253,26 @@ def smart_promo_management_worker(process_id, config, process_logger):
         sys.path.insert(0, current_dir)
     
     try:
-        from replenish_promo_code_lambda.browser_manager import create_browser_manager
-        from replenish_promo_code_lambda.promo_logic import PromoService
+        from bonus_system.bonus_replenish_promo_code.browser_manager import create_browser_manager
+        from bonus_system.bonus_replenish_promo_code.promo_logic import PromoService
         from promo_smart import PromoSmartManager
         
-        # Імпортуємо необхідні функції безпосередньо з глобального простору імен
-        # Оскільки ми вже в модулі promo_generator, просто отримуємо посилання на функції
-        import inspect
-        current_module = inspect.getmodule(inspect.currentframe())
+        # Імпортуємо функції з поточного модуля безпосередньо
+        # Оскільки ми знаходимося в робочому процесі, функції вже визначені в цьому файлі
+        global set_table_rows_per_page, apply_bon_filter_once, apply_amount_range_filter
+        global clear_all_filters, sort_table_by_amount, get_all_bon_codes_with_pagination
+        global create_promo_codes, delete_specific_promo_codes, check_existing_bon_codes_for_amount, generate_bon_code
         
-        # Імпортуємо функції через importlib
-        import importlib.util
-        import types
+        # Перевіряємо, що всі функції доступні
+        required_functions = [
+            'set_table_rows_per_page', 'apply_bon_filter_once', 'apply_amount_range_filter',
+            'clear_all_filters', 'sort_table_by_amount', 'get_all_bon_codes_with_pagination',
+            'create_promo_codes', 'delete_specific_promo_codes', 'check_existing_bon_codes_for_amount', 'generate_bon_code'
+        ]
         
-        # Отримуємо модуль прямо з файлу
-        spec = importlib.util.spec_from_file_location("promo_generator", __file__)
-        if spec and spec.loader:
-            promo_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(promo_module)
-            
-            # Імпортуємо всі необхідні функції
-            set_max_rows_per_page = getattr(promo_module, 'set_max_rows_per_page', None)
-            apply_bon_filter_once = getattr(promo_module, 'apply_bon_filter_once', None)
-            apply_amount_range_filter = getattr(promo_module, 'apply_amount_range_filter', None)
-            clear_all_filters = getattr(promo_module, 'clear_all_filters', None)
-            sort_table_by_discount_amount = getattr(promo_module, 'sort_table_by_discount_amount', None)
-            get_all_bon_codes_from_table = getattr(promo_module, 'get_all_bon_codes_from_table', None)
-            create_codes_for_amount = getattr(promo_module, 'create_codes_for_amount', None)
-            delete_specific_promo_codes = getattr(promo_module, 'delete_specific_promo_codes', None)
-            select_specific_promo_codes = getattr(promo_module, 'select_specific_promo_codes', None)
-            delete_selected_codes = getattr(promo_module, 'delete_selected_codes', None)
-            delete_selected_codes_headless_optimized = getattr(promo_module, 'delete_selected_codes_headless_optimized', None)
-            generate_random_bon_code = getattr(promo_module, 'generate_random_bon_code', None)
-        else:
-            process_logger.error("❌ Не вдалося отримати spec для модуля")
-            return {'success': False, 'error': 'Module spec error'}
-        
-        # Перевіряємо, що всі функції знайдені
         missing_functions = []
-        for func_name, func in [
-            ('set_max_rows_per_page', set_max_rows_per_page),
-            ('apply_bon_filter_once', apply_bon_filter_once),
-            ('apply_amount_range_filter', apply_amount_range_filter),
-            ('clear_all_filters', clear_all_filters),
-            ('sort_table_by_discount_amount', sort_table_by_discount_amount),
-            ('get_all_bon_codes_from_table', get_all_bon_codes_from_table),
-            ('create_codes_for_amount', create_codes_for_amount),
-            ('delete_specific_promo_codes', delete_specific_promo_codes),
-            ('select_specific_promo_codes', select_specific_promo_codes),
-            ('delete_selected_codes', delete_selected_codes),
-            ('delete_selected_codes_headless_optimized', delete_selected_codes_headless_optimized),
-            ('generate_random_bon_code', generate_random_bon_code),
-        ]:
-            if func is None:
+        for func_name in required_functions:
+            if func_name not in globals():
                 missing_functions.append(func_name)
         
         if missing_functions:
@@ -326,9 +318,9 @@ def smart_promo_management_worker(process_id, config, process_logger):
         process_logger.info(f"🔍 Процес {process_id}: Отримання промокодів для діапазону {config['start_amount']}-{config['end_amount']}...")
         
         # Встановлюємо максимальну кількість рядків на сторінці
-        set_max_rows_per_page(iframe, 160)
+        set_table_rows_per_page(iframe, 160)
         
-        # Застосовуємо BON фільтр
+        # Застосовуємо BON фільтр один раз для всього діапазону
         if not apply_bon_filter_once(iframe):
             process_logger.error(f"❌ Процес {process_id}: Не вдалося застосувати BON фільтр")
             return {'success': False, 'error': 'BON filter failed'}
@@ -339,15 +331,31 @@ def smart_promo_management_worker(process_id, config, process_logger):
         
         # Сортуємо таблицю по розміру знижки для кращої організації даних
         process_logger.info(f"📊 Застосовуємо сортування по розміру знижки ({config['sort_order']})...")
-        sort_success = sort_table_by_discount_amount(iframe, config['sort_order'])
+        sort_success = sort_table_by_amount(iframe, config['sort_order'])
         if not sort_success:
             process_logger.warning("⚠️ Не вдалося відсортувати таблицю по розміру знижки, продовжуємо без сортування")
         else:
             sort_label = "зростання" if config['sort_order'] == "asc" else "спадання"
             process_logger.info(f"✅ Таблицю успішно відсортовано по розміру знижки ({sort_label})")
 
+        # Якщо активна опція видалення всіх існуючих промокодів перед додаванням нових
+        if config.get('delete_existing_before_add', False):
+            process_logger.info(f"🗑️ Процес {process_id}: Видалення всіх існуючих промокодів перед додаванням нових...")
+            
+            # Отримуємо page з promo_service
+            page = promo_service.page if hasattr(promo_service, 'page') else None
+            
+            # Видаляємо всі промокоди в діапазоні
+            deleted_count = delete_all_promo_codes_in_range(iframe, config['start_amount'], config['end_amount'], process_logger, page)
+            total_operations['deleted'] += deleted_count
+            
+            # Очищуємо словник кодів, оскільки всі були видалені
+            all_codes_by_amount = {}
+            for amount in range(config['start_amount'], config['end_amount'] + 1):
+                all_codes_by_amount[amount] = []
+
         # Отримуємо коди для діапазону
-        all_codes_by_amount = get_all_bon_codes_from_table(iframe)
+        all_codes_by_amount = get_all_bon_codes_with_pagination(iframe)
         
         if not all_codes_by_amount:
             process_logger.info(f"ℹ️ Процес {process_id}: Не знайдено промокодів у діапазоні")
@@ -358,35 +366,66 @@ def smart_promo_management_worker(process_id, config, process_logger):
         # Аналіз та обробка кожної суми
         for amount in range(config['start_amount'], config['end_amount'] + 1):
             code_objects = all_codes_by_amount.get(amount, [])
-            active_codes = [obj['code'] for obj in code_objects if obj['status'] == 'active']
             
-            current_count = len(active_codes)
+            # Розділяємо коди на активні та неактивні
+            active_codes = [obj['code'] for obj in code_objects if obj['status'] == 'active']
+            inactive_codes = [obj['code'] for obj in code_objects if obj['status'] == 'inactive']
+            
+            current_count_active = len(active_codes)
+            current_count_inactive = len(inactive_codes)
             target_count = config['target_codes_per_amount']
             
-            process_logger.info(f"📊 Процес {process_id}: Аналіз суми {amount} грн - поточно {current_count}, потрібно {target_count}")
+            process_logger.info(f"📊 Процес {process_id}: Аналіз суми {amount} грн - {current_count_active} активних + {current_count_inactive} неактивних = {len(code_objects)} всього (цільова к-ть: {target_count})")
             
-            if current_count < target_count:
+            # КРОК 1: ЗАВЖДИ видаляємо неактивні коди (незалежно від auto_delete)
+            if inactive_codes:
+                process_logger.info(f"🗑️ Процес {process_id}: Видаляємо {len(inactive_codes)} неактивних кодів для суми {amount} грн")
+                
+                # Застосовуємо фільтр по конкретній сумі для видалення неактивних
+                # BON фільтр вже застосований глобально, тільки змінюємо діапазон сум
+                if apply_amount_range_filter(iframe, amount, amount):
+                    page = promo_service.page if hasattr(promo_service, 'page') else None
+                    delete_result = delete_specific_promo_codes(iframe, inactive_codes, page)
+                    deleted_inactive_count = delete_result.get('deleted', 0) if isinstance(delete_result, dict) else delete_result
+                    total_operations['deleted'] += deleted_inactive_count
+                    
+                    process_logger.info(f"✅ Процес {process_id}: Видалено {deleted_inactive_count} неактивних кодів з {len(inactive_codes)}")
+                    
+                else:
+                    process_logger.warning(f"⚠️ Процес {process_id}: Не вдалося застосувати фільтр для видалення неактивних кодів суми {amount} грн")
+            
+            # КРОК 2: Аналізуємо активні коди
+            if current_count_active < target_count:
                 # Потрібно створити коди
-                needed = target_count - current_count
+                needed = target_count - current_count_active
                 process_logger.info(f"➕ Процес {process_id}: Для {amount} грн потрібно створити {needed} кодів")
                 
                 # Генеруємо нові коди
                 new_codes = []
                 for _ in range(needed):
-                    new_code = generate_random_bon_code(active_codes + new_codes)
+                    # Перевіряємо, чи вже існують промокоди для цієї суми
+                    existing_bon_codes = check_existing_bon_codes_for_amount(amount, active_codes + new_codes)
+                    
+                    # Якщо вже є достатньо існуючих кодів, не генеруємо нові
+                    if len(existing_bon_codes) >= target_count:
+                        process_logger.info(f"ℹ️ Процес {process_id}: Вже існує достатньо промокодів для суми {amount} грн")
+                        break
+                    
+                    # Генеруємо новий код
+                    new_code = generate_bon_code(amount)
                     new_codes.append(new_code)
                 
                 # Створюємо коди
-                created_count = create_codes_for_amount(promo_service, new_codes, amount)
+                created_count = create_promo_codes(promo_service, new_codes, amount)
                 total_operations['created'] += created_count
                 
                 # Оновлюємо дані для результату
                 for code in new_codes[:created_count]:
                     active_codes.append(code)
                     
-            elif current_count > target_count and config.get('auto_delete_excess', False):
+            elif current_count_active > target_count and config.get('auto_delete_excess', False):
                 # Потрібно видалити зайві коди
-                excess = current_count - target_count
+                excess = current_count_active - target_count
                 process_logger.info(f"➖ Процес {process_id}: Для {amount} грн потрібно видалити {excess} зайвих кодів")
                 
                 codes_to_delete = active_codes[-excess:]  # Видаляємо останні
@@ -395,13 +434,7 @@ def smart_promo_management_worker(process_id, config, process_logger):
                 # щоб коди були видимі в таблиці
                 process_logger.info(f"🔍 Застосовуємо фільтр по сумі {amount} грн перед видаленням...")
                 
-                # Очищаємо попередні фільтри
-                clear_all_filters(iframe)
-                
-                # Застосовуємо BON фільтр
-                apply_bon_filter_once(iframe)
-                
-                # Застосовуємо фільтр по конкретній сумі
+                # BON фільтр вже застосований, тільки змінюємо діапазон сум
                 if apply_amount_range_filter(iframe, amount, amount):
                     # Отримуємо page з promo_service
                     page = promo_service.page if hasattr(promo_service, 'page') else None
@@ -416,9 +449,6 @@ def smart_promo_management_worker(process_id, config, process_logger):
                 else:
                     process_logger.warning(f"⚠️ Не вдалося застосувати фільтр для суми {amount} грн, пропускаємо видалення")
                 
-                # Відновлюємо фільтр по діапазону для подальшої роботи
-                apply_bon_filter_once(iframe)
-                apply_amount_range_filter(iframe, config['start_amount'], config['end_amount'])
             else:
                 total_operations['unchanged'] += 1
                 
@@ -439,36 +469,112 @@ def smart_promo_management_worker(process_id, config, process_logger):
     finally:
         try:
             if 'browser_manager' in locals() and browser_manager:
-                if hasattr(browser_manager, 'close'):
-                    browser_manager.close()
-                elif hasattr(browser_manager, 'cleanup'):
+                if hasattr(browser_manager, 'cleanup'):
                     browser_manager.cleanup()
                 elif hasattr(browser_manager, 'browser') and browser_manager.browser:
-                    browser_manager.browser.close()
+                    browser_manager.cleanup()
+                elif hasattr(browser_manager, 'close'):
+                    browser_manager.cleanup()
         except Exception as cleanup_error:
             process_logger.warning(f"⚠️ Помилка при закритті браузера: {cleanup_error}")
 
-def generate_random_bon_code(existing_codes):
+def check_existing_bon_codes_for_amount(amount, existing_codes):
     """
-    Генерує унікальний BON код, який не існує в списку існуючих.
+    Перевіряє, чи існують промокоди з заданою сумою, що починаються з 'BON'.
     
     Args:
+        amount: сума промокоду
         existing_codes: список існуючих кодів
         
     Returns:
-        str: новий унікальний BON код
+        list: список існуючих промокодів з заданою сумою
     """
-    while True:
-        # Генеруємо код формату BON + 6 символів
-        suffix = generate_random_string(6)
-        new_code = f"BON{suffix}"
-        
-        if new_code not in existing_codes:
-            return new_code
+    logger.debug(f"🔍 Перевірка наявності існуючих BON кодів для суми {amount} грн")
+    bon_codes_for_amount = []
+    for code in existing_codes:
+        # Перевіряємо, чи код починається з 'BON' і чи містить правильну суму
+        # if code.startswith('BON') and str(amount) in code:
+        bon_codes_for_amount.append(code)
+    
+    logger.debug(f"✅ Знайдено {len(bon_codes_for_amount)} існуючих BON кодів для суми {amount} грн")
+    return bon_codes_for_amount
 
-def parallel_promo_management():
+def generate_bon_code(amount):
     """
-    Основна функція паралельного управління промокодами.
+    Генерує новий BON код для заданої суми.
+    
+    Args:
+        amount: сума промокоду
+        
+    Returns:
+        str: новий BON код
+    """
+    logger.debug(f"🔄 Генерація нового BON коду для суми {amount} грн")
+    suffix = generate_random_string(5)
+    new_code = f"BON{amount}{suffix}"
+    logger.debug(f"✅ Згенеровано новий BON код: {new_code}")
+    return new_code
+
+def download_from_s3():
+    """Завантажує існуючі дані з S3."""
+    try:
+        import boto3
+        s3 = boto3.client('s3', region_name=CONFIG['region'])
+        bucket = CONFIG['s3_bucket']
+        key = CONFIG['s3_key']
+        
+        logger.info(f"📥 Завантаження існуючих промокодів з S3: s3://{bucket}/{key}")
+        
+        response = s3.get_object(Bucket=bucket, Key=key)
+        existing_data = json.loads(response['Body'].read().decode('utf-8'))
+        
+        logger.info("✅ Існуючі промокоди успішно завантажено з S3")
+        return existing_data
+        
+    except Exception as e:
+        if 'NoSuchKey' in str(e):
+            logger.info("ℹ️ Файл промокодів не існує в S3, створюємо новий")
+            return {}
+        else:
+            logger.error(f"❌ Помилка при завантаженні з S3: {e}")
+            logger.warning("Продовжуємо з порожньою базою промокодів")
+            return {}
+
+def upload_to_s3(data):
+    """Завантажує дані в S3."""
+    try:
+        import boto3
+        s3 = boto3.client('s3', region_name=CONFIG['region'])
+        bucket = CONFIG['s3_bucket']
+        key = CONFIG['s3_key']
+        
+        logger.info(f"☁️ Завантаження промокодів в S3: s3://{bucket}/{key}")
+        
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(data, indent=2),
+            ContentType='application/json'
+        )
+        
+        logger.info("✅ Промокоди успішно завантажено в S3")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Помилка при завантаженні в S3: {e}")
+        logger.error("Перевірте ваші AWS креданшали та налаштування")
+        return False
+
+def generate_random_string(length):
+    """Генерує випадковий рядок із великих літер та цифр."""
+    import random
+    import string
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
+def manage_promo_codes():
+    """
+    🎯 ГОЛОВНА ФУНКЦІЯ УПРАВЛІННЯ ПРОМОКОДАМИ (ПАРАЛЕЛЬНИЙ РЕЖИМ)
+    
     Запускає декілька процесів для обробки різних діапазонів сум,
     а потім збирає результати та записує їх в S3.
     """
@@ -557,16 +663,45 @@ def parallel_promo_management():
     if successful_processes > 0 and CONFIG['sync_s3']:
         logger.info("☁️ Запис результатів в S3...")
         
-        # Готуємо дані для S3
-        s3_data = {}
+        # Завантажуємо існуючі дані з S3
+        logger.info("📥 Завантажуємо існуючі промокоди з S3...")
+        existing_s3_data = download_from_s3()
+        
+        # Якщо існуючих даних немає, створюємо порожній словник
+        if not existing_s3_data:
+            existing_s3_data = {}
+        
+        # Видаляємо метадані з існуючих даних, якщо вони є
+        if '_metadata' in existing_s3_data:
+            existing_metadata = existing_s3_data.pop('_metadata')
+            logger.info(f"📋 Знайдено існуючі метадані: останнє оновлення {existing_metadata.get('last_updated', 'невідоме')}")
+        
+        # Готуємо дані для S3 - об'єднуємо існуючі з новими
+        s3_data = existing_s3_data.copy()  # Копіюємо всі існуючі дані
+        
+        # Оновлюємо тільки ті діапазони, які були успішно оброблені
+        logger.info("🔄 Об'єднуємо нові результати з існуючими даними...")
+        updated_ranges = []
         for amount, codes in all_codes_data.items():
             s3_data[str(amount)] = codes
+            updated_ranges.append(amount)
+        
+        if updated_ranges:
+            min_updated = min(updated_ranges)
+            max_updated = max(updated_ranges)
+            logger.info(f"📊 Оновлено промокоди для діапазону: {min_updated}-{max_updated}")
+            logger.info(f"📋 Всього оновлено сум: {len(updated_ranges)}")
+        
+        # Підрахуємо загальну статистику
+        total_amounts_in_s3 = len([k for k in s3_data.keys() if k != '_metadata'])
+        logger.info(f"📈 Загальна кількість сум з промокодами в S3: {total_amounts_in_s3}")
         
         # Додаємо метадані
         s3_data['_metadata'] = {
             'last_updated': datetime.datetime.now().isoformat(),
             'total_processes': len(processes),
             'successful_processes': successful_processes,
+            'updated_ranges': updated_ranges,
             'operations': total_operations,
             'config': {
                 'target_codes_per_amount': CONFIG['target_codes_per_amount'],
@@ -582,45 +717,48 @@ def parallel_promo_management():
     logger.info("🏁 ПАРАЛЕЛЬНЕ УПРАВЛІННЯ ПРОМОКОДАМИ ЗАВЕРШЕНО")
     return successful_processes == len(processes)
 
-# Налаштування логування
-import datetime
+if __name__ == "__main__":
+    # Налаштування логування
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
 
-# Створюємо папку для логів, якщо вона не існує
-log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
+    log_timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    log_filename = os.path.join(log_dir, f'promo_generator_{log_timestamp}.log')
 
-# Формуємо ім'я файлу логу з датою та часом
-log_timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-log_filename = os.path.join(log_dir, f'promo_generator_{log_timestamp}.log')
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-# Налаштовуємо логування одночасно у файл та консоль
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(log_format)
+    logger.addHandler(console_handler)
 
-# Налаштування форматування логів
-log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+    file_handler.setFormatter(log_format)
+    logger.addHandler(file_handler)
 
-# Налаштовуємо виведення у консоль
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_format)
-logger.addHandler(console_handler)
+    logger.propagate = False
+    logger.info(f"🔍 Логування налаштовано. Логи зберігаються у: {log_filename}")
 
-# Налаштовуємо виведення у файл
-file_handler = logging.FileHandler(log_filename, encoding='utf-8')
-file_handler.setFormatter(log_format)
-logger.addHandler(file_handler)
+    # Запуск головної функції
+    try:
+        # На macOS, 'spawn' є безпечнішим методом, особливо при роботі з GUI/браузерами
+        multiprocessing.set_start_method('spawn', force=True)
+        logger.info("🔧 Встановлено метод запуску multiprocessing: spawn (для macOS)")
 
-# Вимикаємо поширення логів, щоб уникнути дублювання від basicConfig
-logger.propagate = False
+        success = manage_promo_codes()
+        if success:
+            logger.info("✅ Управління промокодами завершено успішно.")
+            sys.exit(0)
+        else:
+            logger.error("❌ Управління промокодами завершено з помилками.")
+            sys.exit(1)
+    except Exception as e:
+        logger.critical(f"💥 Критична помилка в головному процесі: {e}", exc_info=True)
+        sys.exit(1)
 
-logger.info(f"🔍 Логування налаштовано. Логи зберігаються у: {log_filename}")
-
-def generate_random_string(length):
-    """Генерує випадковий рядок із великих літер та цифр."""
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
-
-def apply_amount_filter_improved(iframe, amount):
+def apply_amount_filter(iframe, amount):
     """
     💰 Застосовує фільтр по сумі промокодів в адмін-панелі.
     
@@ -657,52 +795,80 @@ def apply_amount_range_filter(iframe, start_amount, end_amount):
     try:
         logger.info(f"💰 Застосовуємо фільтр по діапазону сум: {start_amount}-{end_amount} грн")
         
-        # 1. Знаходимо заголовок "Розмір знижки" (колонка 4778)
-        amount_header = iframe.locator('#header_id_4778')
-        if not amount_header.count():
-            logger.error("❌ Не знайдено заголовок 'Розмір знижки'")
+        # Використовуємо JavaScript для активації фільтра по сумі
+        filter_js = f"""
+        (function() {{
+            try {{
+                // Знаходимо заголовок "Розмір знижки" (колонка 4778)
+                const amountHeader = document.querySelector('#header_id_4778');
+                if (!amountHeader) {{
+                    return {{ success: false, error: "Не знайдено заголовок 'Розмір знижки'" }};
+                }}
+                
+                // Активуємо фільтр без використання hover
+                const event = new MouseEvent('mouseenter', {{
+                    view: window,
+                    bubbles: true,
+                    cancelable: true
+                }});
+                amountHeader.dispatchEvent(event);
+                
+                // Даємо час для появи блоку фільтрації
+                setTimeout(() => {{
+                    const filterBlock = document.querySelector('#sortingBlock_4778');
+                    if (!filterBlock) {{
+                        return {{ success: false, error: "Не знайдено блок фільтрації" }};
+                    }}
+                    
+                    // Активуємо блок фільтрації
+                    filterBlock.click();
+                    
+                    // Знаходимо поля введення
+                    const fromField = filterBlock.querySelector('input[name="text1"][placeholder="від"]');
+                    const toField = filterBlock.querySelector('input[name="text2"][placeholder="до"]');
+                    
+                    if (!fromField || !toField) {{
+                        return {{ success: false, error: "Поля 'від' і 'до' не знайдено" }};
+                    }}
+                    
+                    // Заповнюємо поля
+                    fromField.value = '{start_amount}';
+                    toField.value = '{end_amount}';
+                    
+                    // Тригеримо події введення
+                    fromField.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    toField.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    
+                    // Натискаємо Enter для застосування фільтра
+                    const enterEvent = new KeyboardEvent('keydown', {{
+                        key: 'Enter',
+                        code: 'Enter',
+                        keyCode: 13,
+                        bubbles: true
+                    }});
+                    toField.dispatchEvent(enterEvent);
+                    
+                    return {{ success: true }};
+                }}, 300);
+                
+                return {{ success: true }};
+            }} catch (error) {{
+                return {{ success: false, error: error.message }};
+            }}
+        }})();
+        """
+        
+        # Виконуємо JavaScript
+        result = iframe.evaluate(filter_js)
+        
+        if isinstance(result, dict) and not result.get('success', False):
+            error_msg = result.get('error', 'Невідома помилка')
+            logger.error(f"❌ Помилка при застосуванні фільтра діапазону: {error_msg}")
             return False
         
-        logger.info("🖱️ Наводимо мишку на заголовок 'Розмір знижки'...")
-        amount_header.hover()
-        time.sleep(0.3)  # Коротке очікування для появи фільтра
-        
-        # 2. Перевіряємо чи з'явився блок фільтрації
-        filter_block = iframe.locator('#sortingBlock_4778')
-        if not filter_block.count():
-            logger.error("❌ Не знайдено блок фільтрації")
-            return False
-        
-        # 3. Чекаємо щоб поля стали видимими
-        from_field = iframe.locator('#sortingBlock_4778 input[name="text1"][placeholder="від"]')
-        to_field = iframe.locator('#sortingBlock_4778 input[name="text2"][placeholder="до"]')
-        
-        # Додатково клікаємо на блок фільтрації щоб активувати поля
-        filter_block.click()
-        time.sleep(0.3)
-        
-        if not from_field.count() or not to_field.count():
-            logger.error("❌ Поля 'від' і 'до' не знайдено")
-            return False
-        
-        # 4. Застосовуємо фільтр по діапазону
-        logger.info(f"📝 Застосовуємо фільтр діапазону: від {start_amount} до {end_amount}...")
-        
-        from_field.click()
-        from_field.fill(str(start_amount))
-        time.sleep(0.3)
-        
-        to_field.click()
-        to_field.fill(str(end_amount))
-        time.sleep(0.3)
-        
-        # 5. Натискаємо Enter для застосування фільтра
-        logger.info("⌨️ Натискаємо Enter для застосування фільтра діапазону...")
-        to_field.press('Enter')
-        
-        # Власне очікування завершення фільтрації
+        # Очікуємо завершення фільтрації
         logger.info("⏳ Очікуємо завершення фільтрації по діапазону сум...")
-        time.sleep(1.0)  # Збільшую час очікування для діапазону
+        time.sleep(1.5)  # Збільшую час очікування для діапазону
 
         logger.info(f"✅ Фільтр по діапазону сум {start_amount}-{end_amount} успішно застосовано")
         return True
@@ -711,7 +877,7 @@ def apply_amount_range_filter(iframe, start_amount, end_amount):
         logger.error(f"❌ Помилка при застосуванні фільтра діапазону: {e}")
         return False
 
-def apply_code_filter_improved(iframe, search_term="BON"):
+def apply_code_filter(iframe, search_term="BON"):
     """
     🔍 Застосовує фільтр по коду промокоду в адмін-панелі.
     
@@ -728,44 +894,72 @@ def apply_code_filter_improved(iframe, search_term="BON"):
     try:
         logger.info(f"🔍 Застосовуємо фільтр по коду: '{search_term}'...")
         
-        # 1. Знаходимо заголовок "Код" (колона 4776)
-        code_header = iframe.locator('#header_id_4776')
-        if not code_header.count():
-            logger.error("❌ Не знайдено заголовок 'Код'")
+        # Використовуємо JavaScript для активації фільтра по коду
+        filter_js = f"""
+        (function() {{
+            try {{
+                // Знаходимо заголовок "Код" (колонка 4776)
+                const codeHeader = document.querySelector('#header_id_4776');
+                if (!codeHeader) {{
+                    return {{ success: false, error: "Не знайдено заголовок 'Код'" }};
+                }}
+                
+                // Активуємо фільтр без використання hover
+                const event = new MouseEvent('mouseenter', {{
+                    view: window,
+                    bubbles: true,
+                    cancelable: true
+                }});
+                codeHeader.dispatchEvent(event);
+                
+                // Даємо час для появи блоку фільтрації
+                setTimeout(() => {{
+                    const filterBlock = document.querySelector('#sortingBlock_4776');
+                    if (!filterBlock) {{
+                        return {{ success: false, error: "Не знайдено блок фільтрації для коду" }};
+                    }}
+                    
+                    // Активуємо блок фільтрації
+                    filterBlock.click();
+                    
+                    // Знаходимо поле пошуку
+                    const searchField = filterBlock.querySelector('input[placeholder="пошук..."]');
+                    if (!searchField) {{
+                        return {{ success: false, error: "Поле пошуку не знайдено" }};
+                    }}
+                    
+                    // Заповнюємо поле пошуку
+                    searchField.value = '{search_term}';
+                    
+                    // Тригеримо події введення
+                    searchField.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    
+                    // Натискаємо Enter для застосування фільтра
+                    const enterEvent = new KeyboardEvent('keydown', {{
+                        key: 'Enter',
+                        code: 'Enter',
+                        keyCode: 13,
+                        bubbles: true
+                    }});
+                    searchField.dispatchEvent(enterEvent);
+                    
+                    return {{ success: true }};
+                }}, 300);
+                
+                return {{ success: true }};
+            }} catch (error) {{
+                return {{ success: false, error: error.message }};
+            }}
+        }})();
+        """
+        
+        # Виконуємо JavaScript
+        result = iframe.evaluate(filter_js)
+        
+        if isinstance(result, dict) and not result.get('success', False):
+            error_msg = result.get('error', 'Невідома помилка')
+            logger.error(f"❌ Помилка при застосуванні фільтра по коду: {error_msg}")
             return False
-        
-        logger.info("🖱️ Наводимо мишку на заголовок 'Код'...")
-        code_header.hover()
-        time.sleep(0.2)  # Зменшую очікування для появи фільтра з 0.5 на 0.2
-        
-        # 2. Перевіряємо чи з'явився блок фільтрації
-        filter_block = iframe.locator('#sortingBlock_4776')
-        if not filter_block.count():
-            logger.error("❌ Не знайдено блок фільтрації для коду")
-            return False
-        
-        # 3. Знаходимо поле пошуку
-        search_field = iframe.locator('#sortingBlock_4776 input[placeholder="пошук..."]')
-        
-        # Додатково клікаємо на блок фільтрації щоб активувати поле
-        filter_block.click()
-        time.sleep(0.3)  # Зменшую очікування з 1 на 0.3
-        
-        if not search_field.count():
-            logger.error("❌ Поле пошуку не знайдено")
-            return False
-        
-        logger.info(f"📝 Заповнюємо поле пошуку: '{search_term}'")
-        
-        # 4. Очищаємо та заповнюємо поле пошуку
-        search_field.click()
-        search_field.clear()
-        search_field.fill(search_term)
-        time.sleep(0.2)  # Зменшую очікування з 0.5 на 0.2
-        
-        # 5. Натискаємо Enter для застосування фільтра
-        logger.info("⌨️ Натискаємо Enter для застосування фільтра...")
-        search_field.press('Enter')
         
         # Власне очікування завершення фільтрації
         logger.info("⏳ Очікуємо завершення фільтрації по коду...")
@@ -806,7 +1000,7 @@ def apply_bon_filter_once(iframe):
         clear_all_filters(iframe)
         
         # Застосовуємо фільтр по BON
-        success = apply_code_filter_improved(iframe, "BON")
+        success = apply_code_filter(iframe, "BON")
         
         if success:
             logger.info("✅ Фільтр BON успішно застосовано, тепер можна збирати дані з усіх сторінок")
@@ -851,807 +1045,425 @@ def clear_all_filters(iframe):
         logger.warning(f"⚠️ Помилка скидання фільтрів: {e}")
         return False
 
-def get_all_bon_codes_from_table(iframe):
+def get_codes_from_current_page(
+    iframe, 
+    all_codes_set: Optional[Set[str]] = None, 
+    duplicates_info: Optional[Dict[str, List[int]]] = None, 
+    sort_order: str = "asc"
+) -> Dict[int, List[Dict[str, Any]]]:
     """
-    Отримує всі **АКТИВНІ** BON коди з поточної таблиці (після застосування фільтрів).
-    Обробляє всі сторінки пагінації.
+    Оптимізована функція для збору всіх BON кодів з поточної сторінки таблиці.
+    Використовує evaluate_all для мінімізації запитів до браузера.
+    Зберігає всю логіку оригіналу: відстеження дублікатів, сортування.
+
+    Args:
+        iframe: Playwright iframe об'єкт.
+        all_codes_set: (опціонально) множина для відстеження унікальних кодів.
+        duplicates_info: (опціонально) словник для збору інформації про дублікати.
+        sort_order: Порядок сортування (для логування).
+
+    Returns:
+        Dict[int, List[Dict[str, Any]]]: Словник, де ключ - сума, 
+        значення - список об'єктів {'code': str, 'status': str, 'amount': int}.
+        Неактивні коди додаються на початок списку, активні - в кінець.
+    """
     
+    # Ініціалізуємо локальні структури даних, якщо вони не передані
+    if all_codes_set is None:
+        all_codes_set_local = set()
+        using_external_set = False
+    else:
+        all_codes_set_local = all_codes_set
+        using_external_set = True
+        
+    if duplicates_info is None:
+        duplicates_info_local = {}
+        using_external_duplicates = False
+    else:
+        duplicates_info_local = duplicates_info
+        using_external_duplicates = True
+
+    codes_by_amount = {}
+    page_codes_count = 0
+    
+    try:
+        logger.debug("🚀 Починаємо оптимізований збір даних з таблиці...")
+        
+        # --- Основна оптимізація: отримуємо всі дані за один запит ---
+        # Селектор для всіх видимих рядків тіла таблиці, що містять дані
+        rows_selector = 'table#datagrid tbody tr:visible:not(.no-data)'
+
+        # Використовуємо evaluate_all для отримання даних з усіх рядків одразу
+        rows_data = iframe.locator(rows_selector).evaluate_all("""
+        rows => rows.map(row => {
+            const cells = Array.from(row.querySelectorAll('td'));
+            
+            // Мінімальна кількість комірок для валідного рядка
+            if (cells.length < 5) { 
+                return null; 
+            }
+            
+            // Індекси комірок (можуть відрізнятися, потрібно адаптувати):
+            // 0 - ID, 1 - Назва, 2 - Статус, 3 - Код, 4 - Сума
+            const statusTextRaw = cells[2]?.innerText?.trim() || '';
+            const codeTextRaw = cells[3]?.innerText?.trim() || '';
+            const amountTextRaw = cells[4]?.innerText?.trim() || '';
+            
+            return {
+                statusText: statusTextRaw,
+                codeText: codeTextRaw,
+                amountText: amountTextRaw
+            };
+        }).filter(Boolean) // Видаляємо null значення (невалідні рядки)
+        """)
+        
+        logger.debug(f"📥 Отримано дані з {len(rows_data)} потенційних рядків таблиці.")
+
+        # --- Обробляємо отримані дані в Python ---
+        for i, row_data in enumerate(rows_data):
+            try:
+                status_text_raw = row_data['statusText']
+                code_raw = row_data['codeText']
+                amount_text_raw = row_data['amountText']
+
+                # --- Обробка коду ---
+                if not code_raw:
+                    logger.debug(f"Пропущено рядок {i+1}: порожній код.")
+                    continue
+                
+                code = code_raw.strip()
+                
+                # Додаткове логування для діагностики формату кодів
+                logger.debug(f"Аналіз коду: '{code}' (початок: '{code[:10]}'...)")
+                
+                # Перевіряємо, чи код починається з 'BON' або має інший формат
+                if not code.startswith('BON'):
+                    logger.info(f"⚠️ Код не починається з 'BON': '{code}'")
+                    # Продовжуємо обробку, але позначаємо це в логах
+                    # Можливо, це існуючі коди з іншим форматом
+
+                # --- Обробка статусу ---
+                status_text_normalized = status_text_raw.strip().lower()
+                
+                # Розширена логіка розпізнавання статусів
+                active_keywords = ['так', 'yes', 'активний', 'active', 'активен', 'true', '1', 'включен', 'enabled']
+                inactive_keywords = ['ні', 'no', 'неактивний', 'inactive', 'неактивен', 'false', '0', 'выключен', 'disabled', 'вимкнено', 'вимкнений']
+                
+                is_active = None
+                
+                # Спочатку перевіряємо точні збіги
+                if status_text_normalized in active_keywords:
+                    is_active = True
+                elif status_text_normalized in inactive_keywords:
+                    is_active = False
+                else:
+                    # Якщо точного збігу немає, шукаємо часткові збіги
+                    for keyword in active_keywords:
+                        if keyword in status_text_normalized:
+                            is_active = True
+                            break
+                    
+                    if is_active is None:
+                        for keyword in inactive_keywords:
+                            if keyword in status_text_normalized:
+                                is_active = False
+                                break
+                
+                # Якщо все ще не визначили статус, логуємо для діагностики
+                if is_active is None:
+                    logger.warning(f"⚠️ Не вдалося розпізнати статус для коду {code}: '{status_text_raw}' -> '{status_text_normalized}'")
+                    # За замовчуванням вважаємо неактивним для безпеки
+                    is_active = False
+                
+                status_str = 'active' if is_active else 'inactive'
+                
+                # Додаткове логування для діагностики
+                if not is_active:
+                    logger.info(f"🔍 Знайдено НЕАКТИВНИЙ код: {code} (статус: '{status_text_raw}')")
+                else:
+                    logger.debug(f"🔍 Знайдено активний код: {code} (статус: '{status_text_raw}')")
+
+                # --- Обробка суми ---
+                amount_match = re.search(r'(\d+)', amount_text_raw)
+                if not amount_match:
+                    logger.debug(f" ⚠️ НЕ РОЗПІЗНАНО СУМУ: для коду {code} (колонка: '{amount_text_raw}')")
+                    continue
+                
+                amount = int(amount_match.group(1))
+
+                # --- Логіка відстеження дублікатів (як в оригіналі) ---
+                is_duplicate = False
+                if code in all_codes_set_local:
+                    is_duplicate = True
+                    if code not in duplicates_info_local:
+                        # Знаходимо оригінальну суму цього коду з вже зібраних даних
+                        original_amount = None
+                        for check_amount, check_code_objects in codes_by_amount.items():
+                            # Шукаємо код серед об'єктів
+                            if any(obj['code'] == code for obj in check_code_objects):
+                                original_amount = check_amount
+                                break
+                        
+                        if original_amount is not None:
+                            duplicates_info_local[code] = [original_amount]
+                        else:
+                            # Якщо не знайшли (теоретично можливо при одночасному доступі),
+                            # додаємо поточну суму як першу
+                            duplicates_info_local[code] = []
+
+                    # Додаємо поточну суму до списку сум для цього коду
+                    if amount not in duplicates_info_local[code]:
+                        duplicates_info_local[code].append(amount)
+                    
+                    # Логування дубліката
+                    if len(set(duplicates_info_local[code])) > 1:
+                        logger.error(f"❌ КРИТИЧНИЙ ДУБЛІКАТ: {code} має РІЗНІ СУМИ: {sorted(list(set(duplicates_info_local[code])))} грн! Поточна: {amount} грн")
+
+                # --- Додаємо код до множини унікальних (якщо використовуємо локальну) ---
+                if not using_external_set:
+                    all_codes_set_local.add(code)
+
+                # --- Додаємо код до основного словника з сортуванням ---
+                if amount not in codes_by_amount:
+                    codes_by_amount[amount] = []
+                
+                code_obj = {
+                    'code': code,
+                    'status': status_str,
+                    'amount': amount
+                }
+
+                # Сортуємо: неактивні коди першими, потім активні
+                # (як в оригіналі: insert(0) для неактивних, append для активних)
+                if not is_active:
+                    codes_by_amount[amount].insert(0, code_obj) # Неактивні на початок
+                else:
+                    codes_by_amount[amount].append(code_obj) # Активні в кінець
+
+                page_codes_count += 1
+
+            except (ValueError, IndexError, KeyError) as e:
+                logger.debug(f"Помилка обробки рядка {i}: {e}")
+                continue # Продовжуємо з наступним рядком
+
+        # Детальна статистика по статусах
+        total_active = 0
+        total_inactive = 0
+        for amount_codes in codes_by_amount.values():
+            for code_obj in amount_codes:
+                if code_obj['status'] == 'active':
+                    total_active += 1
+                else:
+                    total_inactive += 1
+
+        logger.info(f"✅ Сторінку оброблено. Знайдено {page_codes_count} BON кодів:")
+        logger.info(f"   🟢 Активних: {total_active}")
+        logger.info(f"   🔴 Неактивних: {total_inactive}")
+        
+        # Повертаємо коди, знайдені на цій конкретній сторінці
+        return codes_by_amount
+
+    except Exception as e:
+        logger.error(f"❌ Критична помилка в get_all_bon_codes_from_table_optimized: {e}", exc_info=True)
+        # У випадку критичної помилки повертаємо порожній результат
+        return {}
+    
+def get_all_bon_codes_with_pagination(iframe) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Отримує всі BON коди з поточної таблиці (після застосування фільтрів),
+    обробляючи всі сторінки пагінації.
+    Використовує оптимізовану функцію збору даних з однієї сторінки.
+    Зберігає всю логіку оригіналу: пагінація, очікування, обробка помилок.
+
     Args:
         iframe: Елемент iframe таблиці промокодів
-    
+
     Returns:
         dict: {сума: [список_об'єктів_кодів]} - коди зі статусами
     """
     # Ініціалізуємо codes_by_amount на початку для уникнення помилок
     codes_by_amount = {}
-    duplicates_info = {}  # Ініціалізуємо тут, щоб була доступна в finally
-    
+    duplicates_info = {} # Ініціалізуємо тут, щоб була доступна в finally
+
     try:
         logger.info("📋 ПОЧАТОК збору всіх BON кодів з відфільтрованої таблиці (з усіх сторінок)...")
-        
+
         # Перевіряємо поточні налаштування таблиці
         pager_text = iframe.locator('.datagrid-pager .pages').first.inner_text().strip()
         logger.info(f"📄 Інформація про пагінацію: {pager_text}")
-        
+
         # Зменшена пауза для стабілізації в HEADED режимі
         headed_mode = os.getenv('PLAYWRIGHT_HEADED', 'True').lower() in ['true', '1', 'yes']
         if headed_mode:
             logger.info("🖥️ HEADED режим: пауза 0.5 сек для стабілізації...")
-            time.sleep(0.5)  # Зменшую з 2 сек до 0.5 сек
+            time.sleep(0.5) # Зменшую з 2 сек до 0.5 сек
 
         # Використовуємо Set для запобігання дублікатів
-        codes_by_amount = {}
-        all_codes_set = set()  # Для відстеження всіх унікальних кодів
-        duplicates_info = {}  # Зберігаємо інформацію про дублікати: {код: [список_сум]}
+        all_codes_set: Set[str] = set() # Для відстеження всіх унікальних кодів
         current_page = 1
         has_next_page = True
         total_processed_rows = 0
-        
+
         while has_next_page:
             logger.info(f"📄 Обробка сторінки {current_page}...")
-            
-            # Отримуємо всі рядки на поточній сторінці
-            all_rows = iframe.locator('table#datagrid tbody tr')
-            rows_count = all_rows.count()
-            
-            logger.info(f"📋 Аналізуємо {rows_count} рядків на сторінці {current_page}...")
-            
-            if rows_count == 0:
-                logger.warning(f"⚠️ На сторінці {current_page} немає рядків! Можливо кінець даних.")
-                break
-            
-            # Лічильник для цієї сторінки
-            page_codes_count = 0
-            
-            # Обробляємо рядки на поточній сторінці
-            for i in range(rows_count):
-                try:
-                    row = all_rows.nth(i)
-                    
-                    # Перевіряємо, чи це валідний рядок з даними
-                    cells = row.locator('td')
-                    cell_count = cells.count()
-                    if not row.is_visible() or cell_count < 5:
-                        continue
-                    
-                    # Код знаходиться в 4-й колонці (індекс 3)
-                    code_cell = cells.nth(3)
-                    code = code_cell.inner_text().strip()
-                    
-                    if not code or not code.startswith('BON'):
-                        continue
-                    
-                    # Розмір знижки знаходиться в 5-й колонці (індекс 4)
-                    amount_cell = cells.nth(4)
-                    amount_text = amount_cell.inner_text().strip()
-                    
-                    # Парсимо суму з тексту (може бути "168 грн" або просто "168")
-                    amount_match = re.search(r'(\d+)', amount_text)
-                    if not amount_match:
-                        logger.debug(f"  ⚠️ НЕ РОЗПІЗНАНО СУМУ: для коду {code} (колонка: '{amount_text}') - сторінка {current_page}, рядок {i+1}")
-                        continue
-                    
-                    amount = int(amount_match.group(1))
-                    
-                    # Перевіряємо, чи це дублікат
-                    if code in all_codes_set:
-                        # ЗБЕРІГАЄМО ІНФОРМАЦІЮ ПРО ДУБЛІКАТ
-                        if code not in duplicates_info:
-                            # Знаходимо оригінальну суму цього коду
-                            original_amount = None
-                            for check_amount, check_code_objects in codes_by_amount.items():
-                                check_codes = [obj['code'] for obj in check_code_objects]
-                                if code in check_codes:
-                                    original_amount = check_amount
-                                    break
-                            
-                            if original_amount:
-                                duplicates_info[code] = [original_amount]
-                        
-                        # Додаємо поточну суму до списку сум для цього коду
-                        if amount not in duplicates_info[code]:
-                            duplicates_info[code].append(amount)
-                        
-                        # Логуємо дублікат тільки для критичних помилок
-                        if len(set(duplicates_info[code])) > 1:
-                            logger.error(f"  ❌ КРИТИЧНИЙ ДУБЛІКАТ: {code} має РІЗНІ СУМИ: {sorted(duplicates_info[code])} грн! Поточна: {amount} грн")
-                        
-                        continue
-                    
-                    # Додаємо код до загального списку
-                    if code not in all_codes_set:
-                        all_codes_set.add(code)
-                    
-                    # Отримуємо статус промокоду (колонка 3, індекс 2)
-                    status_cell = cells.nth(2)
-                    status_text = status_cell.inner_text().strip().lower()
-                    is_active = status_text in ['так', 'yes', 'активний', 'active']
-                    
-                    # Додаємо код до основного масиву
-                    if amount not in codes_by_amount:
-                        codes_by_amount[amount] = []
-                    
-                    # Зберігаємо код як об'єкт зі статусом
-                    code_obj = {
-                        'code': code,
-                        'status': 'active' if is_active else 'inactive',
-                        'amount': amount
-                    }
-                    
-                    # Сортуємо: неактивні коди першими, потім активні
-                    if not is_active:
-                        codes_by_amount[amount].insert(0, code_obj)  # Неактивні на початок
-                    else:
-                        codes_by_amount[amount].append(code_obj)     # Активні в кінець
 
-                    page_codes_count += 1
-                    
-                except Exception as row_error:
-                    logger.debug(f"Помилка обробки рядка {i}: {row_error}")
-                    continue
-                    
-            logger.info(f"✅ Додано {page_codes_count} кодів з поточної сторінки {current_page}")
+            # --- Виклик ОПТИМІЗОВАНОЇ функції для поточної сторінки ---
+            page_codes = get_codes_from_current_page(
+                iframe, 
+                all_codes_set=all_codes_set, 
+                duplicates_info=duplicates_info, 
+                sort_order="asc" # або передавати ззовні, якщо потрібно
+            )
+            page_codes_count = sum(len(codes) for codes in page_codes.values())
             total_processed_rows += page_codes_count
-            
-            # Виводимо стислу статистику по кодах на поточній сторінці
-            if page_codes_count > 0:
-                logger.info(f"📊 Сторінка {current_page}: {page_codes_count} кодів")
-                # Показуємо розподіл тільки якщо є коди і включене детальне логування
-                if CONFIG.get('verbose_logging', False):
-                    for amount in sorted(codes_by_amount.keys()):
-                        count = len(codes_by_amount[amount])
-                        if count > 0:
-                            active_count = sum(1 for obj in codes_by_amount[amount] if obj['status'] == 'active')
-                            inactive_count = count - active_count
-                            logger.info(f"  💰 {amount} грн: {active_count} активних + {inactive_count} неактивних = {count} всього")
-            
-            # Логуємо загальну кількість унікальних кодів
+
+            # --- Об'єднуємо результати з поточної сторінки в загальний словник ---
+            for amount, code_objects in page_codes.items():
+                if amount not in codes_by_amount:
+                    codes_by_amount[amount] = []
+                # Додаємо коди, зберігаючи їхню відсортовану черговість (неактивні спочатку)
+                codes_by_amount[amount].extend(code_objects)
+
+            # --- Логування стану сторінки ---
+            logger.info(f" 💰 Сторінка {current_page}: оброблено {page_codes_count} кодів")
+            for amount, codes in page_codes.items():
+                count = len(codes)
+                active_count = sum(1 for obj in codes if obj['status'] == 'active')
+                inactive_count = count - active_count
+                logger.info(f" 💰 {amount} грн: {active_count} активних + {inactive_count} неактивних = {count} всього")
+
             logger.info(f"📝 Загальна кількість унікальних кодів після сторінки {current_page}: {len(all_codes_set)}")
-            
-            # Перевіряємо наявність наступної сторінки
+
+            # --- Перевіряємо наявність наступної сторінки ---
             # Оновлений код для знаходження стрілки "вправо" для пагінації
             next_page_button = iframe.locator('.datagrid-pager .fl-l.r.active').first
-            has_next_page = has_next_page & next_page_button.count() > 0
-            
+            has_next_page = next_page_button.count() > 0
+
             # Виводимо інформацію про пагінацію
             if has_next_page:
                 logger.info(f"📑 Є наступна сторінка після {current_page}")
             else:
                 logger.info(f"📑 Це остання сторінка ({current_page})")
-            
+
             if has_next_page:
-                # Перед переходом зберігаємо інформацію про поточну сторінку для порівняння
+                # --- Перед переходом зберігаємо інформацію про поточну сторінку для порівняння ---
                 previous_page_info = iframe.locator('.datagrid-pager .pages').first.inner_text().strip()
                 logger.info(f"📑 Поточний стан пагінації перед переходом: {previous_page_info}")
-                
+
                 # Для статистики рахуємо кількість кодів до переходу
                 previous_all_codes_count = len(all_codes_set)
                 logger.info(f"📊 Кількість унікальних кодів перед переходом: {previous_all_codes_count}")
-                
-                # Зберігаємо останній код з поточної сторінки для перевірки
-                last_processed_codes = list(all_codes_set)[-10:] if all_codes_set else []
-                logger.info(f"🔍 Останні 10 оброблених кодів: {last_processed_codes}")
-                
-                logger.info(f"📑 ПЕРЕХІД: з сторінки {current_page} на сторінку {current_page + 1}...")
-                
+
+                # --- Клік на кнопку наступної сторінки ---
                 try:
-                    # Явно очікуємо, щоб кнопка була клікабельною
-                    next_page_button.wait_for(state='visible', timeout=3000)
-                    
-                    # Клікаємо на кнопку переходу на наступну сторінку
-                    logger.info(f"🖱️ Клікаємо на кнопку наступної сторінки...")
                     next_page_button.click()
-                    time.sleep(0.5)  # Коротка пауза для початку переходу
-                    
-                    # Оновлюємо лічильник сторінок
-                    current_page += 1
-                    logger.info(f"📄 Перейшли до сторінки {current_page}")
-                    
-                    # Почекаємо явно на індикатор завантаження, якщо він є
-                    logger.info(f"⏳ Чекаємо на завершення завантаження нової сторінки...")
-                    
-                    # Спочатку перевіримо наявність лоадера
-                    loader = iframe.locator('#datagrid-loader')
-                    if loader.count() > 0:
-                        try:
-                            loader.wait_for(state='visible', timeout=1000)  # Спочатку чекаємо, щоб лоадер став видимим
-                            logger.info(f"🔄 Лоадер з'явився, чекаємо його зникнення...")
-                            loader.wait_for(state='hidden', timeout=5000)  # Потім чекаємо, щоб він зник
-                            logger.info(f"✅ Лоадер зник, сторінка завантажилась")
-                        except Exception as loader_error:
-                            logger.info(f"⚠️ Не вдалося відстежити лоадер: {loader_error}")
-                            # Якщо не вдалося відстежити лоадер, чекаємо стабілізації мережевої активності
-                            #iframe.page.wait_for_load_state('networkidle', timeout=3000)
-                    else:
-                        # Якщо лоадера немає, просто почекаємо
-                        logger.info(f"⏱️ Лоадер не знайдено, чекаємо 1.5 секунди...")
-                        time.sleep(1.5)  # Даємо час на завантаження нової сторінки
-                    
-                    # Перевіряємо, що сторінка дійсно змінилася
+                    logger.info("➡️ Клік по кнопці 'наступна сторінка'...")
+
+                    # --- Очікування завантаження нової сторінки ---
+                    try:
+                        # Очікуємо, поки loader зникне
+                        loader = iframe.locator('#datagrid-loader')
+                        loader.wait_for(state='hidden', timeout=5000)
+                        logger.info("✅ Лоадер прихований, сторінка завантажена")
+                    except Exception:
+                        logger.info("📊 Лоадер не знайдено, використовуємо альтернативний метод очікування")
+                        # Альтернативний метод - чекаємо на стабілізацію мережевої активності
+                        iframe.page.wait_for_load_state('networkidle', timeout=3000)
+
+                    # --- Перевіряємо, що сторінка дійсно змінилася ---
                     new_page_info = iframe.locator('.datagrid-pager .pages').first.inner_text().strip()
                     logger.info(f"📑 Поточний стан пагінації після переходу: {new_page_info}")
-                    
+
                     # Порівнюємо інформацію про сторінку до і після переходу
                     if previous_page_info == new_page_info:
                         logger.warning(f"⚠️ ПРОБЛЕМА ПАГІНАЦІЇ! Інформація про сторінку не змінилася після переходу!")
-                        
                         # Спробуємо ще раз
                         logger.info(f"🔄 Спроба повторного кліку на кнопку наступної сторінки...")
-                        next_page_button = iframe.locator('.datagrid-pager .fl-l.r.active').first
                         if next_page_button.count() > 0:
                             next_page_button.click()
-                            time.sleep(2)  # Збільшимо затримку для надійності
+                            time.sleep(2) # Збільшимо затримку для надійності
                         else:
                             logger.error(f"❌ Кнопка наступної сторінки зникла при повторній спробі!")
-                    
+                            break # Виходимо з циклу, якщо кнопка зникла
+
                 except Exception as click_error:
                     logger.error(f"❌ Помилка при переході на наступну сторінку: {click_error}")
-                    break
-            else:
-                logger.info(f"📑 Досягнуто останньої сторінки ({current_page}).")
+                    break # Виходимо з циклу в разі критичної помилки
+
+                current_page += 1
+            # --- Кінець блоку переходу на наступну сторінку ---
+
+        # --- Підсумок збору ---
+        logger.info("✅ ЗБІР ВСІХ СТОРІНОК ЗАВЕРШЕНО!")
+        logger.info(f"📊 ПІДСУМОК: Загалом знайдено {len(all_codes_set)} унікальних BON промокодів")
+        total_codes = sum(len(codes) for codes in codes_by_amount.values())
+        logger.info(f"📊 ПІДСУМОК: Загалом оброблено {total_codes} BON промокодів (включаючи активні та неактивні)")
+        logger.info(f"📊 ПІДСУМОК: Загалом оброблено {total_processed_rows} рядків")
+        logger.info(f"📚 ПІДСУМОК: Загалом оброблено {current_page} сторінок пагінації")
+
+        # Детальна статистика по активних/неактивних кодах
+        total_active_final = 0
+        total_inactive_final = 0
+        amounts_with_codes = []
         
-        # ОБРОБКА ДУБЛІКАТІВ ПІСЛЯ ЗБОРУ ВСІХ КОДІВ
+        for amount, code_objects in codes_by_amount.items():
+            active_count = sum(1 for obj in code_objects if obj['status'] == 'active')
+            inactive_count = len(code_objects) - active_count
+            total_active_final += active_count
+            total_inactive_final += inactive_count
+            
+            if code_objects:  # Якщо є коди для цієї суми
+                amounts_with_codes.append(amount)
+                logger.info(f"💰 Сума {amount} грн: {active_count} активних + {inactive_count} неактивних = {len(code_objects)} всього")
+        
+        logger.info(f"📊 ФІНАЛЬНА СТАТИСТИКА:")
+        logger.info(f"   🟢 Активних промокодів: {total_active_final}")
+        logger.info(f"   🔴 Неактивних промокодів: {total_inactive_final}")
+        logger.info(f"   💰 Сум з промокодами: {len(amounts_with_codes)}")
+        
+        if amounts_with_codes:
+            logger.info(f"   💰 Діапазон сум: {min(amounts_with_codes)}-{max(amounts_with_codes)} грн")
+
+        # --- ВАЛІДАЦІЯ ДУБЛІКАТІВ ---
         if duplicates_info:
-            logger.warning(f"🔄 ЗНАЙДЕНО {len(duplicates_info)} ДУБЛІКАТІВ ПІД ЧАС ЗБОРУ!")
-            logger.info("🔧 ПОЧИНАЄМО ОБРОБКУ ДУБЛІКАТІВ...")
-            
+            logger.info(f"🔍 Виявлено {len(duplicates_info)} унікальних кодів з дублікатами!")
             for code, amounts in duplicates_info.items():
-                logger.info(f"🔍 Обробляємо дублікат: {code} для сум: {amounts}")
-                
-                if len(amounts) == 1:
-                    # Дублікат з однаковою сумою - нічого не робимо
-                    logger.info(f"  ✅ Код {code} має однакову суму {amounts[0]} грн - дублікат вже відфільтрований")
+                if len(set(amounts)) > 1: # Перевірка на справжній дублікат
+                    logger.error(f"❌ КРИТИЧНИЙ ДУБЛІКАТ: {code} має РІЗНІ СУМИ: {sorted(list(set(amounts)))} грн!")
                 else:
-                    # Дублікат з різними сумами - потрібно додати до всіх сум
-                    logger.warning(f"  ⚠️ Код {code} має різні суми: {amounts} грн")
-                    
-                    # Знаходимо, в якій сумі код вже є
-                    current_amount = None
-                    for amount in amounts:
-                        if amount in codes_by_amount:
-                            code_objects = codes_by_amount[amount]
-                            codes_list = [obj['code'] for obj in code_objects]
-                            if code in codes_list:
-                                current_amount = amount
-                                break
-                    
-                    if current_amount:
-                        logger.info(f"  📍 Код {code} наразі знаходиться в сумі {current_amount} грн")
-                        
-                        # Додаємо код до всіх інших сум з цього дубліката
-                        for amount in amounts:
-                            if amount != current_amount:
-                                if amount not in codes_by_amount:
-                                    codes_by_amount[amount] = []
-                                
-                                # Перевіряємо чи код вже є
-                                codes_list = [obj['code'] for obj in codes_by_amount[amount]]
-                                if code not in codes_list:
-                                    # Додаємо як неактивний дублікат
-                                    duplicate_obj = {
-                                        'code': code,
-                                        'status': 'inactive',  # Дублікати завжди неактивні
-                                        'amount': amount
-                                    }
-                                    codes_by_amount[amount].append(duplicate_obj)
-                                    logger.info(f"  ➕ ДОДАНО: {code} до суми {amount} грн (дублікат)")
-                                else:
-                                    logger.info(f"  ✅ Код {code} вже є в сумі {amount} грн")
-                    else:
-                        logger.error(f"  ❌ КРИТИЧНА ПОМИЛКА: Код {code} не знайдено в жодній сумі!")
-            
+                    # Можливо, це просто повторна зустріч того ж коду-суми
+                    logger.debug(f"🔍 Повторний код (можливо дублікат): {code} для суми {amounts[0]} грн")
             logger.info("✅ ОБРОБКА ДУБЛІКАТІВ ЗАВЕРШЕНА!")
         else:
             logger.info("✅ Дублікатів під час збору не виявлено")
-        
-        # Перевіряємо, чи всі коди унікальні та правильно підраховані
-        total_codes = sum(len(codes) for codes in codes_by_amount.values())
-        logger.info(f"📊 ПІДСУМОК: Загалом знайдено {total_codes} BON промокодів (включаючи активні та неактивні)")
-        logger.info(f"📊 ПІДСУМОК: Загалом оброблено {total_processed_rows} рядків")
-        logger.info(f"📚 ПІДСУМОК: Загалом оброблено {current_page} сторінок пагінації")
-        logger.info(f"🔍 ПІДСУМОК: Кількість унікальних кодів у all_codes_set: {len(all_codes_set)}")
-        
-        # Рахуємо активні та неактивні промокоди окремо
-        active_count = 0
-        inactive_count = 0
-        for amount, code_objects in codes_by_amount.items():
-            for obj in code_objects:
-                if obj['status'] == 'active':
-                    active_count += 1
-                else:
-                    inactive_count += 1
-        
-        logger.info(f"📊 СТАТИСТИКА ЗА СТАТУСАМИ: {active_count} активних + {inactive_count} неактивних = {total_codes} всього")
-        
-        # Звіряємо розмір all_codes_set з сумою кодів для всіх сум
-        if total_codes != len(all_codes_set):
-            logger.warning(f"⚠️ НЕСУМІСНІСТЬ ДАНИХ: Кількість унікальних кодів ({len(all_codes_set)}) відрізняється від суми кодів по сумам ({total_codes})!")
-            
-            # Детальна перевірка дублікатів
-            logger.info(f"🔍 Виконуємо перевірку на можливі дублікати промокодів...")
-            # Збираємо всі коди в один список
-            all_codes_list = []
-            for amount, code_objects in codes_by_amount.items():
-                for obj in code_objects:
-                    all_codes_list.append(obj['code'])
-            
-            # Перевіряємо на дублікати
-            code_counts = {}
-            for code in all_codes_list:
-                if code in code_counts:
-                    code_counts[code] += 1
-                else:
-                    code_counts[code] = 1
-            
-            # Виводимо інформацію про дублікати
-            duplicates = {code: count for code, count in code_counts.items() if count > 1}
-            if duplicates:
-                logger.error(f"❌ ЗНАЙДЕНО ДУБЛІКАТИ В ДАНИХ: {len(duplicates)} кодів дублюються!")
-                for code, count in duplicates.items():
-                    logger.error(f"  ❌ Код {code} зустрічається {count} разів")
-                    # Знаходимо, в яких сумах зустрічається цей код
-                    amounts = []
-                    for amount, code_objects in codes_by_amount.items():
-                        codes_list = [obj['code'] for obj in code_objects]
-                        if code in codes_list:
-                            amounts.append(amount)
-                    logger.error(f"  ❌ Код {code} зустрічається для сум: {amounts}")
-            else:
-                logger.info(f"✅ Дублікатів кодів не знайдено, але є невідповідність між all_codes_set і сумою кодів по сумам")
-        
-        # Показуємо стислий результат по сумам тільки один раз
-        if CONFIG.get('verbose_logging', False):
-            logger.info(f"📊 ПІДСУМОК ПО СУМАМ:")
-            for amount, code_objects in sorted(codes_by_amount.items()):
-                active_codes = [obj for obj in code_objects if obj['status'] == 'active']
-                inactive_codes = [obj for obj in code_objects if obj['status'] == 'inactive']
-                
-                logger.info(f"  💰 {amount} грн: {len(active_codes)} активних + {len(inactive_codes)} неактивних = {len(code_objects)} всього")
-        
-        # Не повертаємо тут, тому що return буде в finally блоці
-        
+
+        return codes_by_amount
+
     except Exception as e:
         logger.error(f"❌ Помилка при зборі BON кодів: {e}")
         return {}
     finally:
-                # Виконуємо ВАЛІДАЦІЮ ДУБЛІКАТІВ НАВІТЬ ЯКЩО БУЛА ПОМИЛКА
+        # Виконуємо ВАЛІДАЦІЮ ДУБЛІКАТІВ НАВІТЬ ЯКЩО БУЛА ПОМИЛКА
         # (якщо codes_by_amount не порожній)
         try:
-            if codes_by_amount:  # Тепер codes_by_amount завжди визначений
+            if codes_by_amount: # Тепер codes_by_amount завжди визначений
                 logger.info("🔍 Перевірка дублікатів після збору всіх кодів...")
-                
                 # Передаємо інформацію про дублікати, якщо вона є
                 if duplicates_info:
                     logger.debug(f"📊 Передаємо інформацію про {len(duplicates_info)} дублікатів до функції валідації")
-                    codes_by_amount = validate_duplicates_after_collection(codes_by_amount, duplicates_info, iframe)
-                else:
-                    codes_by_amount = validate_duplicates_after_collection(codes_by_amount)
-                
-                # Перераховуємо загальну кількість після видалення дублікатів
-                total_codes_after = sum(len(codes) for codes in codes_by_amount.values())
-                logger.info(f"📊 Кількість кодів після видалення дублікатів: {total_codes_after}")
-                
-                # Виводимо фінальний підсумок тільки якщо включене детальне логування
-                if CONFIG.get('verbose_logging', False):
-                    logger.info(f"📊 ФІНАЛЬНИЙ ПІДСУМОК ПО СУМАМ:")
-                    for amount, codes in sorted(codes_by_amount.items()):
-                        active_count = sum(1 for obj in codes if obj['status'] == 'active')
-                        inactive_count = len(codes) - active_count
-                        logger.info(f"  💰 {amount} грн: {active_count} активних + {inactive_count} неактивних = {len(codes)} всього")
-                    
+                # --- Виклик функції валідації (якщо вона є) ---
+                # from ... import validate_duplicates_after_collection
+                # codes_by_amount = validate_duplicates_after_collection(codes_by_amount, duplicates_info, iframe)
+                # logger.debug("🔍 Функція validate_duplicates_after_collection() завершена")
         except Exception as validation_error:
             logger.error(f"❌ Помилка при валідації дублікатів: {validation_error}")
-        
         # Завжди повертаємо codes_by_amount (навіть якщо порожній)
-        return codes_by_amount
+        # return codes_by_amount # Не повертаємо тут, тому що return буде в try блоці
 
+# Створюємо псевдонім для зворотної сумісності
+get_all_bon_codes_from_table = get_all_bon_codes_with_pagination
 
-
-def smart_promo_management_main():
-    """
-    🎯 ГОЛОВНА ФУНКЦІЯ СМАРТ УПРАВЛІННЯ ПРОМОКОДАМИ
-    
-    Автоматично виконує повний цикл управління промокодами:
-    1. Застосовує фільтр BON та отримує ВСІ промокоди одразу з усіх сторінок пагінації
-    2. В пам'яті аналізує промокоди для кожної суми
-    3. Спочатку додає всі недостатні промокоди для всіх сум 
-    4. Потім видаляє всі надлишкові промокоди для всіх сум
-    5. Синхронізує фінальний стан з S3
-    
-    Використовує оптимізацію: завантажує всі коди одразу і обробляє в пам'яті.
-    
-    Returns:
-        bool: успішність виконання всіх операцій
-    """
-    logger.info("🎯 ПОЧАТОК СМАРТ УПРАВЛІННЯ ПРОМОКОДАМИ")
-    logger.info("=" * 60)
-    
-    # Імпорти
-    import sys
-    import os
-    
-    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, parent_dir)
-    
-    from replenish_promo_code_lambda.browser_manager import create_browser_manager
-    from replenish_promo_code_lambda.promo_logic import PromoService
-    from promo_smart import PromoSmartManager
-    
-    # Показуємо конфігурацію
-    target_count = CONFIG['target_codes_per_amount']
-    start_amount = CONFIG['start_amount']
-    end_amount = CONFIG['end_amount']
-    sort_order = CONFIG['sort_order']
-    auto_delete = CONFIG['auto_delete_excess']
-    
-    logger.info(f"⚙️ Конфігурація:")
-    logger.info(f"  🎯 Цільова кількість кодів на суму: {target_count}")
-    logger.info(f"  💰 Діапазон сум: {start_amount}-{end_amount} грн")
-    logger.info(f"  📊 Порядок сортування: {sort_order} ({'зростання' if sort_order == 'asc' else 'спадання'})")
-    logger.info(f"  🗑️ Автовидалення зайвих: {auto_delete}")
-    
-    # Показуємо режим браузера
-    headed_mode = os.getenv('PLAYWRIGHT_HEADED', 'true').lower() in ['true', '1', 'yes']
-    if headed_mode:
-        logger.info("🖥️ HEADED режим: Ви побачите весь процес у браузері!")
-    else:
-        logger.info("👻 HEADLESS режим: Обробка у фоні")
-    
-    browser_manager = create_browser_manager()
-    
-    try:
-        # Ініціалізація браузера
-        logger.info("\n🚀 Ініціалізація браузера...")
-        page = browser_manager.initialize()
-        promo_service = PromoService(page)
-        
-        # Логін
-        logger.info("🔑 Логін в адмін-панель...")
-        if not promo_service.login():
-            logger.error("❌ Не вдалося увійти в адмін-панель")
-            return False
-        
-        logger.info("✅ Успішний логін!")
-        promo_smart_manager = PromoSmartManager(promo_service)
-        
-        # Словник для зберігання фінального стану промокодів для S3
-        final_s3_state = {}
-        # Лічильники для підсумкового звіту
-        total_operations = {'created': 0, 'deleted': 0, 'unchanged': 0}
-        
-        # ЕТАП 1: Застосовуємо BON фільтр і отримуємо ВСІ промокоди з усіх сторінок пагінації
-        logger.info("\n🔍 ЕТАП 1: Отримання всіх BON промокодів з адмін-панелі...")
-        iframe = promo_service._get_iframe()
-        if not iframe:
-            logger.error("❌ Не вдалося отримати iframe")
-            return False
-        
-        # Спочатку встановлюємо максимальну кількість рядків на сторінці
-        max_rows_set = set_max_rows_per_page(iframe, 160)
-        if not max_rows_set:
-            logger.warning("⚠️ Не вдалося встановити максимальну кількість рядків, продовжуємо з поточними налаштуваннями")
-        
-        # Застосовуємо BON фільтр один раз
-        bon_filter_success = apply_bon_filter_once(iframe)
-        if not bon_filter_success:
-            logger.error("❌ Не вдалося застосувати BON фільтр")
-            return False
-            
-        # Сортуємо таблицю по розміру знижки для кращої організації даних
-        logger.info(f"📊 Застосовуємо сортування по розміру знижки ({sort_order})...")
-        sort_success = sort_table_by_discount_amount(iframe, sort_order)
-        if not sort_success:
-            logger.warning("⚠️ Не вдалося відсортувати таблицю по розміру знижки, продовжуємо без сортування")
-        else:
-            sort_label = "зростання" if sort_order == "asc" else "спадання"
-            logger.info(f"✅ Таблицю успішно відсортовано по розміру знижки ({sort_label})")
-        
-        # Застосовуємо фільтр по діапазону сум через адмінку
-        logger.info(f"🎯 Застосовуємо фільтр по діапазону сум: {start_amount}-{end_amount} грн...")
-        range_filter_success = None; #apply_amount_range_filter(iframe, start_amount, end_amount)
-        if not range_filter_success:
-            logger.warning("⚠️ Не вдалося застосувати фільтр діапазону, збираємо всі коди")
-        else:
-            logger.info("✅ Фільтр діапазону успішно застосовано")
-        
-        # Отримуємо всі коди з усіх сторінок пагінації (вже відфільтровані по діапазону)
-        logger.info("🔍 ПОЧАТОК ЗБОРУ ВСІХ ПРОМОКОДІВ...")
-        all_codes_by_amount = get_all_bon_codes_from_table(iframe)
-        logger.info("✅ ЗАВЕРШЕНО ЗБІР ВСІХ ПРОМОКОДІВ")
-        
-        # Додаткова перевірка цілісності даних (тільки якщо включене детальне логування)
-        if all_codes_by_amount and CONFIG.get('verbose_logging', False):
-            # Загальна кількість кодів для всіх сум
-            total_codes = sum(len(codes) for codes in all_codes_by_amount.values())
-            # Кількість унікальних кодів - витягуємо коди з об'єктів
-            all_unique_codes = set()
-            for code_objects in all_codes_by_amount.values():
-                for obj in code_objects:
-                    all_unique_codes.add(obj['code'])
-            
-            logger.info(f"📊 Контрольна перевірка: Знайдено {total_codes} промокодів, з них {len(all_unique_codes)} унікальних")
-            
-            if total_codes != len(all_unique_codes):
-                logger.warning(f"⚠️ ВИЯВЛЕНО ПРОБЛЕМУ: Кількість унікальних кодів ({len(all_unique_codes)}) відрізняється від загальної кількості ({total_codes})!")
-        elif all_codes_by_amount:
-            # Швидка перевірка без детального логування
-            total_codes = sum(len(codes) for codes in all_codes_by_amount.values())
-            logger.info(f"📊 Контрольна перевірка: Знайдено {total_codes} промокодів")
-        
-        if not all_codes_by_amount:
-            logger.warning("⚠️ Не знайдено жодного BON промокоду в системі")
-            # Створимо порожні списки для сум в діапазоні
-            for amount in range(start_amount, end_amount + 1):
-                all_codes_by_amount[amount] = []
-        
-        # ЕТАП 2: Аналіз потреб (створення/видалення) для кожної суми
-        logger.info("\n📊 ЕТАП 2: Аналіз потреб для кожної суми...")
-        
-        # Підготуємо структури даних для обробки
-        codes_to_create_by_amount = {}  # {amount: [codes_to_create]}
-        codes_to_delete_by_amount = {}  # {amount: [codes_to_delete]}
-        
-        # Виводимо загальну статистику перед аналізом (тільки якщо включене детальне логування)
-        if CONFIG.get('verbose_logging', False):
-            total_bon_codes = sum(len(codes) for codes in all_codes_by_amount.values())
-            total_amounts = len(all_codes_by_amount)
-            logger.info(f"📊 Загальна статистика: {total_bon_codes} промокодів для {total_amounts} різних сум")
-            
-            # Підрахунок промокодів по сумах (тільки активних)
-            sums_with_codes = []
-            for amount, code_objects in all_codes_by_amount.items():
-                active_codes = [obj for obj in code_objects if obj['status'] == 'active']
-                if active_codes:
-                    sums_with_codes.append(amount)
-            if sums_with_codes:
-                min_sum = min(sums_with_codes) if sums_with_codes else 0
-                max_sum = max(sums_with_codes) if sums_with_codes else 0
-                logger.info(f"📊 Діапазон наявних сум: від {min_sum} грн до {max_sum} грн")
-        
-        for amount in range(start_amount, end_amount + 1):
-            # Отримуємо коди для цієї суми з новою структурою
-            code_objects = all_codes_by_amount.get(amount, [])
-            
-            # Фільтруємо тільки активні промокоди для підрахунку
-            active_codes = [obj['code'] for obj in code_objects if obj['status'] == 'active']
-            inactive_codes = [obj['code'] for obj in code_objects if obj['status'] == 'inactive']
-            
-            current_count_active = len(active_codes)
-            current_count_inactive = len(inactive_codes)
-            current_count_total = len(code_objects)
-            
-            # Пропускаємо суми, які більші за end_amount, але могли потрапити через неточне сортування
-            if amount > end_amount:
-                logger.info(f"💰 Пропускаємо суму {amount} грн, оскільки вона більша за максимальну ({end_amount} грн)")
-                continue
-
-            logger.info(f"💰 Аналіз суми {amount} грн: {current_count_active} активних + {current_count_inactive} неактивних = {current_count_total} (цільова к-ть: {target_count})")
-            
-            # Видаляємо всі неактивні промокоди
-            if inactive_codes:
-                logger.info(f"�️ Додаємо {len(inactive_codes)} неактивних кодів до списку на видалення")
-                if amount not in codes_to_delete_by_amount:
-                    codes_to_delete_by_amount[amount] = []
-                codes_to_delete_by_amount[amount].extend(inactive_codes)
-            
-            # Аналізуємо активні промокоди
-            if current_count_active == target_count:
-                logger.info("✅ Кількість активних промокодів оптимальна - створення не потрібно")
-                total_operations['unchanged'] += 1
-                
-            elif current_count_active < target_count:
-                # Потрібно додати коди
-                needed_count = target_count - current_count_active
-                logger.info(f"📈 Потрібно ДОДАТИ {needed_count} активних промокодів")
-                
-                # Генеруємо нові коди для цієї суми
-                new_codes = generate_codes_for_amount(amount, needed_count, active_codes)
-                if new_codes:
-                    codes_to_create_by_amount[amount] = new_codes
-                    
-            elif current_count_active > target_count and auto_delete:
-                # Потрібно видалити зайві активні коди
-                excess_count = current_count_active - target_count
-                logger.info(f"📉 Потрібно ВИДАЛИТИ {excess_count} зайвих активних промокодів")
-                
-                # Додаємо коди для видалення (беремо перші зайві)
-                codes_to_delete = active_codes[:excess_count]
-                if amount not in codes_to_delete_by_amount:
-                    codes_to_delete_by_amount[amount] = []
-                codes_to_delete_by_amount[amount].extend(codes_to_delete)
-                
-            elif current_count_active > target_count and not auto_delete:
-                excess_count = current_count_active - target_count
-                logger.warning(f"⚠️ Зайві {excess_count} активних промокодів (автовидалення відключено)")
-            
-            # Зберігаємо тільки активні коди для S3
-            final_s3_state[str(amount)] = active_codes.copy()
-        
-        # ЕТАП 3: Створення всіх нових промокодів для всіх сум
-        total_to_create = sum(len(codes) for codes in codes_to_create_by_amount.values())
-        if total_to_create > 0:
-            logger.info("\n➕ ЕТАП 3: Створення всіх нових промокодів...")
-            logger.info(f"📝 Всього потрібно створити: {total_to_create} промокодів для {len(codes_to_create_by_amount)} сум")
-            
-            for amount, new_codes in sorted(codes_to_create_by_amount.items()):
-                logger.info(f"\n💰 Створення промокодів для суми {amount} грн ({len(new_codes)} шт.)...")
-                created_count = create_codes_for_amount(promo_service, new_codes, amount)
-                total_operations['created'] += created_count
-                
-                if created_count > 0:
-                    # Оновлюємо стан в пам'яті
-                    successfully_created = new_codes[:created_count]
-                    final_s3_state[str(amount)].extend(successfully_created)
-                    logger.info(f"✅ Створено {created_count}/{len(new_codes)} промокодів")
-                else:
-                    logger.warning(f"⚠️ Не вдалося створити жодного промокоду для суми {amount} грн")
-        else:
-            logger.info("\n➕ ЕТАП 3: Створення промокодів - пропускаємо (немає потреби)")
-        
-        # ЕТАП 4: Видалення надлишкових промокодів для всіх сум
-        total_to_delete = sum(len(codes) for codes in codes_to_delete_by_amount.values())
-        if total_to_delete > 0 and auto_delete:
-            logger.info("\n➖ ЕТАП 4: Видалення надлишкових промокодів...")
-            logger.info(f"🗑️ Всього потрібно видалити: {total_to_delete} промокодів для {len(codes_to_delete_by_amount)} сум")
-            
-            # Оновлюємо iframe для видалення
-            iframe = promo_service._get_iframe()
-            if not iframe:
-                logger.error("❌ Не вдалося отримати iframe для видалення")
-            else:
-                # Перезастосовуємо BON фільтр для видалення
-                bon_filter_success = apply_bon_filter_once(iframe)
-                if not bon_filter_success:
-                    logger.error("❌ Не вдалося застосувати BON фільтр перед видаленням")
-                else:
-                    for amount, codes_to_delete in sorted(codes_to_delete_by_amount.items()):
-                        logger.info(f"\n💰 Видалення промокодів для суми {amount} грн ({len(codes_to_delete)} шт.)...")
-                        
-                        # Застосовуємо фільтр для цієї суми
-                        filter_success = apply_amount_filter_improved(iframe, amount)
-                        if filter_success:
-                            # Спочатку перевіряємо, які коди дійсно є в таблиці
-                            logger.info("🔍 Перевірка наявності кодів в таблиці перед видаленням...")
-                            
-                            # Оновлюємо дані з таблиці
-                            time.sleep(0.5)
-                            fresh_codes_dict = get_all_bon_codes_from_table(iframe)
-                            
-                            if fresh_codes_dict and amount in fresh_codes_dict:
-                                code_objects = fresh_codes_dict[amount]
-                                # Отримуємо всі коди (активні та неактивні) для фільтрації
-                                actual_codes_for_amount = [obj['code'] for obj in code_objects]
-                                logger.info(f"🔄 Знайдено {len(actual_codes_for_amount)} актуальних кодів в таблиці")
-                            else:
-                                actual_codes_for_amount = []
-                                logger.warning(f"⚠️ Не знайдено кодів для суми {amount} в актуальній таблиці")
-                            
-                            # Фільтруємо коди для видалення - тільки ті, що є в таблиці
-                            codes_to_delete_filtered = [code for code in codes_to_delete if code in actual_codes_for_amount]
-                            
-                            if not codes_to_delete_filtered:
-                                logger.warning("⚠️ Жодного коду для видалення не знайдено в поточній таблиці")
-                                logger.info("💡 Можливо, коди вже були видалені раніше або кеш застарів")
-                                
-                                # Оновлюємо final_s3_state актуальними даними
-                                final_s3_state[str(amount)] = actual_codes_for_amount
-                                logger.info(f"📊 Стан оновлено актуальними даними: {len(actual_codes_for_amount)} кодів")
-                            else:
-                                logger.info(f"🎯 Знайдено {len(codes_to_delete_filtered)} кодів для видалення з {len(codes_to_delete)} запланованих")
-                                
-                                # Отримуємо page з promo_service для обробки діалогів
-                                page = promo_service.page
-                                deletion_result = delete_specific_promo_codes(iframe, codes_to_delete_filtered, page)
-                                
-                                if deletion_result.get('success', False):
-                                    deleted_count = deletion_result.get('deleted', 0)
-                                    total_operations['deleted'] += deleted_count
-                                    
-                                    # Оновлюємо стан в пам'яті
-                                    successfully_deleted_set = set(codes_to_delete_filtered[:deleted_count])
-                                    final_s3_state[str(amount)] = [code for code in actual_codes_for_amount 
-                                                                 if code not in successfully_deleted_set]
-                                    
-                                    logger.info(f"✅ Видалено {deleted_count}/{len(codes_to_delete_filtered)} промокодів")
-                                else:
-                                    logger.error(f"❌ Помилка видалення промокодів для суми {amount} грн")
-                                    # Все одно оновлюємо стан актуальними даними
-                                    final_s3_state[str(amount)] = actual_codes_for_amount
-                        else:
-                            logger.error(f"❌ Не вдалося застосувати фільтр для видалення промокодів суми {amount} грн")
-        elif total_to_delete > 0 and not auto_delete:
-            logger.info("\n➖ ЕТАП 4: Видалення промокодів - пропускаємо (автовидалення відключено)")
-        else:
-            logger.info("\n➖ ЕТАП 4: Видалення промокодів - пропускаємо (немає потреби)")
-
-        # Підсумок операцій
-        logger.info(f"\n🎉 ПІДСУМОК ОПЕРАЦІЙ")
-        logger.info("=" * 40)
-        logger.info(f"➕ Створено: {total_operations['created']} промокодів")
-        logger.info(f"➖ Видалено: {total_operations['deleted']} промокодів")
-        logger.info(f"⏹️ Без змін: {total_operations['unchanged']} сум")
-        
-        # Синхронізація з S3 (завжди, якщо включена)
-        changes_made = total_operations['created'] > 0 or total_operations['deleted'] > 0
-        if CONFIG['sync_s3']:
-            logger.info("\n🔄 СИНХРОНІЗАЦІЯ ФІНАЛЬНОГО СТАНУ З S3")
-            logger.info("-" * 30)
-            
-            if changes_made:
-                logger.info("📝 Були зміни - оновлюємо S3 з новими даними")
-            else:
-                logger.info("📝 Змін не було, але перевіряємо та оновлюємо S3 актуальними даними")
-            
-            # Завантажуємо поточний стан з S3, щоб не втратити дані по іншим сумам
-            full_s3_state = download_from_s3()
-            
-            # Оновлюємо тільки ті суми, які ми обробляли
-            full_s3_state.update(final_s3_state)
-
-            sync_success = upload_to_s3(full_s3_state)
-            if sync_success:
-                logger.info("✅ Синхронізація з S3 завершена успішно")
-            else:
-                logger.error("❌ Помилка синхронізації з S3")
-        else:
-            logger.info("\n🔄 СИНХРОНІЗАЦІЯ З S3 - відключена в конфігурації")
-        
-        logger.info("\n🎯 СМАРТ УПРАВЛІННЯ ЗАВЕРШЕНО УСПІШНО!")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Критична помилка в смарт управлінні: {e}")
-        return False
-        
-    finally:
-        if browser_manager:
-            logger.info("🧹 Закриття браузера...")
-            browser_manager.cleanup()
-
-def generate_codes_for_amount(amount, count, existing_codes):
-    """
-    Генерує нові промокоди для конкретної суми.
-    
-    Args:
-        amount (int): Сума промокоду
-        count (int): Кількість кодів для генерації
-        existing_codes (list): Існуючі коди для уникнення дублікатів
-        
-    Returns:
-        list: Список згенерованих промокодів
-    """
-    logger.info(f"🎲 Генерація {count} нових промокодів для суми {amount} грн...")
-    
-    amount_str = str(amount)
-    prefix = f'BON{amount_str}'
-    random_part_length = max(3, 7 - len(amount_str))
-    
-    # Створюємо set з існуючих кодів для швидкої перевірки
-    existing_codes_set = set(existing_codes) if existing_codes else set()
-    
-    new_codes = set()
-    attempts = 0
-    max_attempts = count * 100  # Збільшена кількість спроб
-    
-    while len(new_codes) < count and attempts < max_attempts:
-        new_code = prefix + generate_random_string(random_part_length)
-        
-        # Перевіряємо на дублікати
-        if new_code not in existing_codes_set and new_code not in new_codes:
-            new_codes.add(new_code)
-        
-        attempts += 1
-    
-    result = list(new_codes)
-    logger.info(f"✅ Згенеровано {len(result)} унікальних промокодів")
-    
-    if result:
-        logger.debug(f"Приклади нових кодів: {result[:3]}{'...' if len(result) > 3 else ''}")
-    
-    return result
-
-
-def create_codes_for_amount(promo_service, codes_list, amount):
+def create_promo_codes(promo_service, codes_list, amount):
     """
     Створює промокоди в адмін-панелі для конкретної суми.
     Має механізм відновлення у випадку зависання.
@@ -1703,31 +1515,7 @@ def create_codes_for_amount(promo_service, codes_list, amount):
     
     return created_count
 
-def upload_to_s3(data):
-    """Завантажує дані в S3."""
-    try:
-        s3 = boto3.client('s3', region_name=CONFIG['region'])
-        bucket = CONFIG['s3_bucket']
-        key = CONFIG['s3_key']
-        
-        logger.info(f"☁️ Завантаження промокодів в S3: s3://{bucket}/{key}")
-        
-        s3.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=json.dumps(data, indent=2),
-            ContentType='application/json'
-        )
-        
-        logger.info("✅ Промокоди успішно завантажено в S3")
-        return True
-
-    except Exception as e:
-        logger.error(f"❌ Помилка при завантаженні в S3: {e}")
-        logger.error("Перевірте ваші AWS креданшали та налаштування")
-        return False
-
-def set_max_rows_per_page(iframe, rows_count=160):
+def set_table_rows_per_page(iframe, rows_count=160):
     """
     Налаштовує максимальну кількість рядків на сторінці для швидшого збору даних.
     
@@ -1781,7 +1569,7 @@ def set_max_rows_per_page(iframe, rows_count=160):
         logger.error(f"❌ Помилка при налаштуванні кількості рядків: {e}")
         return False
 
-def sort_table_by_discount_amount(iframe, sort_order="asc"):
+def sort_table_by_amount(iframe, sort_order="asc"):
     """
     Сортує таблицю в адмін-панелі по розміру знижки (кліком на заголовок колонки).
     Це допоможе покращити структуру даних та зменшити ймовірність дублікатів.
@@ -1955,6 +1743,144 @@ def sort_table_by_discount_amount(iframe, sort_order="asc"):
         logger.error(f"❌ Помилка при сортуванні таблиці по розміру знижки: {e}")
         return False
 
+def delete_all_promo_codes_on_page(iframe, page=None):
+    """
+    Видаляє всі промокоди на поточній сторінці, використовуючи головний чекбокс для вибору.
+    
+    Args:
+        iframe: iframe адмін-панелі
+        page: основна сторінка (для обробки діалогів підтвердження)
+        
+    Returns:
+        dict: результат операції з кількістю видалених кодів
+    """
+    try:
+        logger.info("🗑️ Видалення всіх промокодів на сторінці...")
+        
+        # Перевіряємо стан таблиці
+        try:
+            all_rows = iframe.locator('table#datagrid tbody tr')
+            total_rows = all_rows.count()
+            logger.info(f"📊 Всього рядків в таблиці: {total_rows}")
+            
+            if total_rows == 0:
+                logger.warning("⚠️ Таблиця порожня - неможливо видалити жодного промокоду")
+                return {"selected": 0, "deleted": 0, "success": False}
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Помилка при перевірці таблиці: {e}")
+        
+        # Вибираємо всі промокоди через головний чекбокс
+        # Використовуємо більш конкретний селектор, оскільки є два елементи з id="datagridMasterCheckBox"
+        master_checkbox = iframe.locator('#header_id_10005 #datagridMasterCheckBox')
+        if master_checkbox.count() > 0:
+            try:
+                # Клікаємо на головний чекбокс для вибору всіх
+                master_checkbox.click()
+                time.sleep(0.5)  # Даємо час для оновлення інтерфейсу
+                
+                # Перевіряємо, чи всі чекбокси вибрані
+                selected_count = iframe.locator('table#datagrid tbody input[type="checkbox"]:checked').count()
+                logger.info(f"✅ Вибрано {selected_count} промокодів через головний чекбокс")
+                
+                if selected_count == 0:
+                    logger.warning("❌ Не вдалося вибрати жодного промокоду")
+                    return {"selected": 0, "deleted": 0, "success": False}
+                    
+            except Exception as e:
+                logger.error(f"❌ Помилка при виборі всіх промокодів: {e}")
+                return {"selected": 0, "deleted": 0, "success": False}
+        else:
+            logger.error("❌ Не знайдено головний чекбокс для вибору всіх промокодів")
+            return {"selected": 0, "deleted": 0, "success": False}
+        
+        # Видаляємо вибрані промокоди
+        # Перевіряємо режим браузера для вибору оптимальної стратегії
+        headed_mode = os.getenv('PLAYWRIGHT_HEADED', 'true').lower() in ['true', '1', 'yes']
+        
+        if headed_mode:
+            logger.info("🖥️ HEADED режим: використовуємо стандартну функцію видалення")
+            delete_success = delete_selected_codes(iframe, page)
+        else:
+            logger.info("👻 HEADLESS режим: використовуємо оптимізовану функцію видалення")
+            delete_success = delete_selected_codes_headless_optimized(iframe, page)
+        
+        if delete_success:
+            logger.info(f"✅ Успішно видалено {selected_count} промокодів!")
+            return {"selected": selected_count, "deleted": selected_count, "success": True}
+        else:
+            logger.error("❌ Помилка при видаленні вибраних промокодів")
+            # Рахуємо, скільки реально було видалено
+            final_checked_count = iframe.locator('table#datagrid tbody input[type="checkbox"]:checked').count()
+            actually_deleted = selected_count - final_checked_count
+            return {"selected": selected_count, "deleted": actually_deleted, "success": False}
+        
+    except Exception as e:
+        logger.error(f"❌ Критична помилка при видаленні всіх промокодів на сторінці: {e}")
+        return {"selected": 0, "deleted": 0, "success": False, "error": str(e)}
+
+def delete_all_promo_codes_in_range(iframe, start_amount, end_amount, process_logger, page=None):
+    """
+    Видаляє всі промокоди в заданому діапазоні сум з урахуванням пагінації.
+    Після видалення кодів з першої сторінки, інші коди автоматично переходять на першу сторінку.
+    
+    Args:
+        iframe: iframe адмін-панелі
+        start_amount (int): початкова сума діапазону
+        end_amount (int): кінцева сума діапазону
+        process_logger: логгер процесу
+        page: основна сторінка (для обробки діалогів підтвердження)
+        
+    Returns:
+        int: кількість видалених промокодів
+    """
+    total_deleted = 0
+    
+    try:
+        process_logger.info(f"🗑️ Видалення всіх промокодів в діапазоні {start_amount}-{end_amount} грн")
+        
+        # Продовжуємо видаляти, поки на сторінці є промокоди
+        iteration = 0
+        max_iterations = 1000  # Захист від нескінченного циклу
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Отримуємо коди з поточної сторінки
+            page_codes = get_codes_from_current_page(iframe)
+            
+            # Збираємо всі коди для видалення
+            codes_to_delete = []
+            for amount, code_objects in page_codes.items():
+                for obj in code_objects:
+                    codes_to_delete.append(obj['code'])
+            
+            if not codes_to_delete:
+                process_logger.info("✅ Всі промокоди в діапазоні видалено")
+                break
+            
+            process_logger.info(f"🗑️ Ітерація {iteration}: знайдено {len(codes_to_delete)} промокодів для видалення")
+            
+            # Видаляємо промокоди
+            # Використовуємо оптимізований метод видалення всіх кодів одразу
+            delete_result = delete_all_promo_codes_on_page(iframe, page)
+            deleted_count = delete_result.get('deleted', 0) if isinstance(delete_result, dict) else delete_result
+            total_deleted += deleted_count
+            
+            process_logger.info(f"✅ Ітерація {iteration}: видалено {deleted_count} промокодів")
+            
+            # Чекаємо трохи, щоб сторінка оновилася
+            time.sleep(15)  # Збільшено затримку для уникнення зависання
+        
+        if iteration >= max_iterations:
+            process_logger.warning("⚠️ Досягнуто максимальну кількість ітерацій видалення")
+            
+    except Exception as e:
+        process_logger.error(f"❌ Помилка при видаленні промокодів в діапазоні: {e}")
+    
+    process_logger.info(f"📊 Загалом видалено {total_deleted} промокодів в діапазоні {start_amount}-{end_amount} грн")
+    return total_deleted
+
 def validate_duplicates_after_collection(codes_by_amount, duplicates_info=None, iframe=None):
     """
     Перевіряє та обробляє дублікати промокодів після збору всіх кодів з усіх сторінок.
@@ -1997,7 +1923,7 @@ def validate_duplicates_after_collection(codes_by_amount, duplicates_info=None, 
                 logger.info(f"� Переобробляємо коди для суми {amount} грн через дублікати...")
                 
                 # Застосовуємо фільтр по сумі
-                if not apply_amount_filter_improved(iframe, amount):
+                if not apply_amount_filter(iframe, amount):
                     logger.warning(f"⚠️ Не вдалося застосувати фільтр для суми {amount} грн")
                     continue
                 
@@ -2103,28 +2029,52 @@ def _validate_final_duplicates(codes_by_amount):
         return codes_by_amount
 
 
-def download_from_s3():
-    """Завантажує поточні промокоди з S3."""
+def select_specific_promo_codes_optimized(iframe, codes_to_select: List[str]) -> bool:
     try:
-        import boto3
-        s3 = boto3.client('s3', region_name=CONFIG['region'])
-        bucket = CONFIG['s3_bucket']
-        key = CONFIG['s3_key']
+        # 1. Отримати всі коди з їхніми індексами (рядками) за один запит
+        rows_data = iframe.locator('table#datagrid tbody tr:visible:not(.no-data)').evaluate_all("""
+        rows => rows.map((row, index) => {
+            const codeCell = row.querySelector('td:nth-child(4)'); // 4-та колонка - код
+            return {
+                code: codeCell ? codeCell.innerText.trim() : null,
+                rowIndex: index
+            };
+        })
+        """)
         
-        logger.info(f"☁️ Завантажуємо поточні промокоди з S3: s3://{bucket}/{key}")
+        # 2. Створити множину кодів для швидкого пошуку
+        codes_to_select_set = set(codes_to_select)
         
-        response = s3.get_object(Bucket=bucket, Key=key)
-        data = json.loads(response['Body'].read().decode('utf-8'))
+        # 3. Знайти індекси рядків, які потрібно вибрати
+        indices_to_select = [data['rowIndex'] for data in rows_data if data['code'] in codes_to_select_set]
         
-        logger.info(f"✅ Завантажено промокоди з S3")
-        return data
+        if not indices_to_select:
+            logger.warning("⚠️ Жодного коду зі списку не знайдено на поточній сторінці.")
+            return False
         
+        logger.info(f"🔍 Знайдено {len(indices_to_select)} кодів для вибору.")
+        
+        # 4. Виконати вибірку чекбоксів за індексами одним JS-запитом
+        # Припускаємо, що чекбокс є першим елементом td:nth-child(1) input[type='checkbox']
+        iframe.evaluate("""(indices) => {
+            const tableBody = document.querySelector('table#datagrid tbody');
+            const rows = tableBody.querySelectorAll('tr:visible:not(.no-data)');
+            indices.forEach(index => {
+                if (index >= 0 && index < rows.length) {
+                    const checkbox = rows[index].querySelector('td:nth-child(1) input[type="checkbox"]');
+                    if (checkbox && !checkbox.checked) {
+                        checkbox.click();
+                    }
+                }
+            });
+        }""", indices_to_select)
+        
+        logger.info(f"✅ Успішно вибрано {len(indices_to_select)} чекбоксів.")
+        return True
+    
     except Exception as e:
-        logger.warning(f"⚠️ Не вдалося завантажити з S3: {e}")
-        logger.info("📝 Повертаємо порожню структуру")
-        return {}
-
-
+        logger.error(f"❌ Помилка при оптимізованому виборі кодів: {e}")
+        return False
 
 def select_specific_promo_codes(iframe, promo_codes, page=None):
     """
@@ -2459,8 +2409,8 @@ def delete_selected_codes_headless_optimized(iframe, page=None):
                     break
             
             if not button_found:
-                logger.error("❌ [HEADLESS] Не вдалося знайти способ видалення")
-                return False
+                logger.info("⌨️ [HEADLESS] Кнопка підтвердження не знайдена, пробуємо Enter...")
+                iframe.press('Enter')
         
         # Очікуємо появи діалогу або модального вікна (збільшую час для headless)
         logger.info("⏳ [HEADLESS] Очікуємо появи діалогу підтвердження...")
@@ -2585,20 +2535,60 @@ def delete_selected_codes_headless_optimized(iframe, page=None):
 
 def main():
     """
-    Основна функція для запуску генератора промокодів.
-    Тепер підтримує паралельний режим роботи.
+    Основна функція для запуску генератора промокодів у паралельному режимі.
     """
-    # Перевіряємо чи потрібно запускати в паралельному режимі
-    parallel_mode = CONFIG.get('parallel_processes', 1) > 1
-    
-    if parallel_mode:
-        logger.info("🔄 Запуск у ПАРАЛЕЛЬНОМУ режимі")
-        return parallel_promo_management()
-    else:
-        logger.info("📝 Запуск у ЗВИЧАЙНОМУ режимі")
-        return smart_promo_management_main()
+    logger.info("🔄 Запуск у ПАРАЛЕЛЬНОМУ режимі")
+    return manage_promo_codes()
+
+# === ПСЕВДОНІМИ ДЛЯ ЗВОРОТНОЇ СУМІСНОСТІ ===
+create_codes_for_amount = create_promo_codes
+set_max_rows_per_page = set_table_rows_per_page
+sort_table_by_discount_amount = sort_table_by_amount
 
 if __name__ == "__main__":
-    # Налаштування для multiprocessing на macOS
-    multiprocessing.set_start_method('spawn', force=True)
-    main()
+    # Налаштування логування
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
+    log_timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    log_filename = os.path.join(log_dir, f'promo_generator_{log_timestamp}.log')
+
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(log_format)
+    logger.addHandler(console_handler)
+
+    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+    file_handler.setFormatter(log_format)
+    logger.addHandler(file_handler)
+
+    logger.propagate = False
+    logger.info(f"🔍 Логування налаштовано. Логи зберігаються у: {log_filename}")
+
+    # Запуск головної функції
+    try:
+        # Встановлюємо метод запуску для сумісності
+        # ВАЖЛИВО: Це має бути зроблено до створення будь-яких процесів
+        if sys.platform.startswith('darwin'):
+             # На macOS, 'spawn' є безпечнішим методом, особливо при роботі з GUI/браузерами
+             multiprocessing.set_start_method('spawn', force=True)
+             logger.info("🔧 Встановлено метод запуску multiprocessing: spawn (для macOS)")
+        elif sys.platform.startswith('linux'):
+             # На Linux, 'fork' є стандартним і швидким методом
+             multiprocessing.set_start_method('fork', force=True)
+             logger.info("🔧 Встановлено метод запуску multiprocessing: fork (для Linux)")
+
+        success = manage_promo_codes()
+        if success:
+            logger.info("✅ Управління промокодами завершено успішно.")
+            sys.exit(0)
+        else:
+            logger.error("❌ Управління промокодами завершено з помилками.")
+            sys.exit(1)
+    except Exception as e:
+        logger.critical(f"💥 Критична помилка в головному процесі: {e}", exc_info=True)
+        sys.exit(1)

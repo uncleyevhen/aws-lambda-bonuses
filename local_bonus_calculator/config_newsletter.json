@@ -1,0 +1,17 @@
+{
+  "api_key": "M2IyOTFjNWM4ODA2OWU0NjU4ZDRkODAxZDVkMTQ4ZGNlMzUzYzc5NQ",
+  "newsletter_funnel_id": 15,
+  "description": "Конфігурація для управління воронкою розсилки",
+  "proxy": {
+    "enabled": true,
+    "host": "p.webshare.io",
+    "port": 80,
+    "username": "oxfvxmgn-UA-rotate",
+    "password": "drciz7b4squj"
+  },
+  "processing": {
+    "max_processes": 2,
+    "requests_per_minute": 60,
+    "request_delay": 1.0
+  }
+}
