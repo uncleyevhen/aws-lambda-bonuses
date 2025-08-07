@@ -1,10 +1,32 @@
 (function() {
   'use strict';
   
+  var DEBUG_MODE = true;
+  var LOG_PREFIX = '[BONUS_THANKYOU]';
   var BONUS_PERCENTAGE = 0.10;
   
   // URL для резервування бонусів через HTTP API
   var BONUS_RESERVE_API_URL = "https://8av2jf7zbe.execute-api.eu-north-1.amazonaws.com/prod/reserve";
+
+  function log(message, data) {
+    if (DEBUG_MODE) {
+      var timestamp = new Date().toISOString();
+      if (data) {
+        console.log(LOG_PREFIX + ' [' + timestamp + '] ' + message, data);
+      } else {
+        console.log(LOG_PREFIX + ' [' + timestamp + '] ' + message);
+      }
+    }
+  }
+
+  function logError(message, error) {
+    var timestamp = new Date().toISOString();
+    if (error) {
+      console.error(LOG_PREFIX + ' [' + timestamp + '] ERROR: ' + message, error);
+    } else {
+      console.error(LOG_PREFIX + ' [' + timestamp + '] ERROR: ' + message);
+    }
+  }
   
   function getOrderNumber() {
     var invoiceRows = document.querySelectorAll('.invoice__item');
@@ -437,6 +459,7 @@
     var hasDeduction = usedBonusAmount > 0;
     
     if (!hasAccrual && !hasDeduction) {
+      log('Немає бонусів для відображення', { hasAccrual: hasAccrual, hasDeduction: hasDeduction });
       return;
     }
     
@@ -446,23 +469,54 @@
       usedBonusAmount: hasDeduction ? usedBonusAmount : 0
     };
     
+    log('Відображення інформації про бонуси', notificationData);
     // Показуємо повідомлення з інформацією про бонуси
     showBonusNotification(notificationData);
   }
-  
-  var currentUrl = window.location.href;
-  var isValidPage = currentUrl.includes('checkout/complete');
-  
-  if (!isValidPage) {
-    return;
+
+  function initThankYouPage() {
+    log('Ініціалізація модуля thank you сторінки');
+    var currentUrl = window.location.href;
+    var isValidPage = currentUrl.includes('checkout/complete');
+    
+    if (!isValidPage) {
+      log('Не thank you сторінка, пропускаємо', { url: currentUrl });
+      return;
+    }
+    
+    log('Thank you сторінка підтверджена, запускаємо виджет бонусів');
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', function() {
+        showBonusWidget();
+      });
+    } else {
+      showBonusWidget();
+    }
+  }
+
+  function handleMutations(groupedMutations) {
+    // Для thank you сторінки мутації не потрібні, оскільки весь функціонал запускається один раз
+    // Але метод потрібен для сумісності з централізованим менеджером
+  }
+
+  function destroyThankYouPage() {
+    log('Знищення модуля thank you сторінки');
+    // Очищення ресурсів якщо потрібно
   }
   
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function() {
-      showBonusWidget(); // Прибираємо затримку
-    });
-  } else {
-    showBonusWidget(); // Прибираємо затримку
+  // Експортуємо модуль для централізованого менеджера
+  if (typeof window.moduleExports === 'undefined') {
+    window.moduleExports = {
+      init: initThankYouPage,
+      handleMutations: handleMutations,
+      destroy: destroyThankYouPage
+    };
+  }
+  
+  // Якщо скрипт завантажується самостійно (не через менеджер)
+  if (typeof window.ScriptManager === 'undefined') {
+    log('Самостійний запуск модуля thank you сторінки');
+    initThankYouPage();
   }
   
 })();

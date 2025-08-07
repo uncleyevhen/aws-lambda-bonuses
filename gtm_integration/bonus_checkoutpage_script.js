@@ -1708,7 +1708,23 @@
 
   log('Завантаження збереженого стану');
   loadBonusState();
-  log('Запуск системи бонусів');
-  initBonusSystem();
+  
+  // Експортуємо модуль для централізованого менеджера
+  if (typeof window.moduleExports === 'undefined') {
+    window.moduleExports = {
+      init: function() {
+        log('Ініціалізація модуля через централізований менеджер');
+        initBonusSystem();
+      },
+      handleMutations: handleMutations,
+      destroy: destroyBonusSystem
+    };
+  }
+  
+  // Якщо скрипт завантажується самостійно (не через менеджер)
+  if (typeof window.ScriptManager === 'undefined') {
+    log('Самостійний запуск модуля бонусної системи');
+    initBonusSystem();
+  }
 
 })();
