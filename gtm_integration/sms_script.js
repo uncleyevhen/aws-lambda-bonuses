@@ -1331,5 +1331,42 @@
             clearTimeout(state.retryTimer);
         }
     });
+
+    // SMS модуль для експорту
+    var smsModule = {
+        init: function() {
+            console.log('[SMS] Ініціалізація модуля через централізований менеджер');
+            // Основна логіка вже запущена вище, тут можна додати додаткову ініціалізацію
+        },
+        handleMutations: function(groupedMutations) {
+            // SMS скрипт поки використовує власний observer, 
+            // але можна перенести логіку сюди в майбутньому
+        },
+        destroy: function() {
+            console.log('[SMS] Знищення модуля SMS');
+            if (state.observer) {
+                state.observer.disconnect();
+                state.observer = null;
+            }
+            if (state.countdownInterval) {
+                clearInterval(state.countdownInterval);
+                state.countdownInterval = null;
+            }
+            if (state.retryTimer) {
+                clearTimeout(state.retryTimer);
+                state.retryTimer = null;
+            }
+        }
+    };
+    
+    // Експортуємо модуль для централізованого менеджера
+    if (typeof moduleExports !== 'undefined') {
+        Object.assign(moduleExports, smsModule);
+    } else if (typeof window.moduleExports === 'undefined') {
+        window.moduleExports = smsModule;
+    }
+    
+    // Повертаємо модуль
+    return smsModule;
     
 })();

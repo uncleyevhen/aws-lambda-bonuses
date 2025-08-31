@@ -1,0 +1,31 @@
+# Конфігурація для Cloudflare Worker заміни тексту
+name = "text-replacer-worker"
+main = "text_replacer_worker.js"  # Використовуємо оптимізовану версію
+compatibility_date = "2024-01-01"
+
+# Маршрутизація - застосовуємо воркер на весь сайт для обробки модальних вікон корзини
+routes = [
+  { pattern = "safeyourlove.com/*", zone_name = "safeyourlove.com" },
+  { pattern = "www.safeyourlove.com/*", zone_name = "safeyourlove.com" }
+]
+
+# Змінні середовища
+[vars]
+ENVIRONMENT = "production"
+DEBUG_MODE = "true"  # Увімкнути для перегляду замін
+
+# Налаштування для різних середовищ
+[env.staging]
+routes = [
+  { pattern = "staging.safeyourlove.com/*", zone_name = "safeyourlove.com" }
+]
+
+[env.staging.vars]
+ENVIRONMENT = "staging"
+DEBUG_MODE = "true"
+
+[env.development]
+# Для локальної розробки
+[env.development.vars]
+ENVIRONMENT = "development"
+DEBUG_MODE = "true"

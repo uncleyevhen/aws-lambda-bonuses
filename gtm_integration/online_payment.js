@@ -402,7 +402,8 @@
     });
   }
 
-  (function(){
+  // Ініціалізація модуля онлайн платежів
+  function initOnlinePayment() {
     var orderNumber = getOrderNumber();
     if (!orderNumber) {
       return;
@@ -420,6 +421,64 @@
     } else {
       addPaymentButton();
     }
-  })();
+  }
+
+  // Обробник мутацій DOM для централізованого менеджера
+  function handleMutations(groupedMutations) {
+    // Перевіряємо чи з'явились нові елементи, які можуть вплинути на платежі
+    if (groupedMutations.childList && groupedMutations.childList.length > 0) {
+      var orderNumber = getOrderNumber();
+      if (orderNumber && !isPaidByLocalStorage(orderNumber)) {
+        // Перевіряємо чи кнопка оплати ще існує
+        var paymentButton = document.querySelector('#payment-button');
+        if (!paymentButton) {
+          // Кнопка зникла, можливо треба її відновити
+          setTimeout(function() {
+            var newOrderNumber = getOrderNumber();
+            if (newOrderNumber === orderNumber) {
+              addPaymentButton();
+            }
+          }, 100);
+        }
+      }
+    }
+  }
+
+  // Знищення модуля
+  function destroyOnlinePayment() {
+    // Видаляємо кнопки платежів
+    var paymentButton = document.querySelector('#payment-button');
+    if (paymentButton && paymentButton.parentNode && paymentButton.parentNode.parentNode) {
+      // Видаляємо весь контейнер з кнопкою
+      paymentButton.parentNode.parentNode.removeChild(paymentButton.parentNode);
+    }
+    
+    // Видаляємо стилі якщо потрібно
+    var styles = document.querySelector('#payment-widget-styles');
+    if (styles && styles.parentNode) {
+      styles.parentNode.removeChild(styles);
+    }
+  }
+
+  // Експортуємо модуль для централізованого менеджера
+  if (typeof moduleExports !== 'undefined') {
+    // Запуск через централізований менеджер скриптів
+    moduleExports.init = initOnlinePayment;
+    moduleExports.handleMutations = handleMutations;
+    moduleExports.destroy = destroyOnlinePayment;
+  } else if (typeof window.moduleExports === 'undefined') {
+    // Резервний експорт для старої версії
+    window.moduleExports = {
+      init: initOnlinePayment,
+      handleMutations: handleMutations,
+      destroy: destroyOnlinePayment
+    };
+  }
+
+  // Якщо скрипт завантажується самостійно (не через менеджер)
+  if (typeof window.ScriptManager === 'undefined') {
+    // Самостійний запуск
+    initOnlinePayment();
+  }
 
 })();

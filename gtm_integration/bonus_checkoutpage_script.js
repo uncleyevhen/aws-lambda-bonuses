@@ -50,7 +50,6 @@
     inputValue: "",
     blockRemovedIntentionally: false,
     currentPageUrl: window.location.href,
-    textReplaced: false,
     elementsDisabled: false,
     disabledOpacity: '1'
   };
@@ -254,47 +253,7 @@
     });
   }
 
-  function replaceTextInElement(element, oldText, newText) {
-    if (!element) return false;
-    var walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null, false);
-    var textNodes = [];
-    var node;
-    while (node = walker.nextNode()) {
-      if (node.nodeValue.includes(oldText)) {
-        textNodes.push(node);
-      }
-    }
-    var replaced = false;
-    textNodes.forEach(function(textNode) {
-      textNode.nodeValue = textNode.nodeValue.replace(new RegExp(oldText, 'g'), newText);
-      replaced = true;
-    });
-    return replaced;
-  }
 
-  function instantTextReplace() {
-    log('Спроба миттєвої заміни тексту');
-    var replaced = false;
-    var language = getCurrentLanguage();
-    var oldText = language === 'ru' ? 'Подарочный сертификат' : 'Подарунковий сертифікат';
-    var newText = language === 'ru' ? 'Бонусы' : 'Бонуси';
-    
-    CERTIFICATE_SELECTORS.forEach(function(selector) {
-      var elements = document.querySelectorAll(selector);
-      log('Знайдено елементів для селектора ' + selector + ':', elements.length);
-      elements.forEach(function(el) {
-        if (el.textContent && el.textContent.includes(oldText) && !el.closest('#bonus-block')) {
-          log('Заміна тексту в елементі', { element: el, oldText: el.textContent, language: language });
-          if (replaceTextInElement(el, oldText, newText)) {
-            replaced = true;
-            log('Текст успішно замінено', { element: el, newText: el.textContent });
-          }
-        }
-      });
-    });
-    log('Результат миттєвої заміни тексту:', replaced);
-    return replaced;
-  }
 
   function isPromoCodeApplied() {
     // Оптимізована перевірка - виконуємо лише необхідні перевірки
@@ -415,13 +374,48 @@
     enableProductRemoval();
   }
 
+  // Функції для роботи з Cookie для Cloudflare Worker
+  function setBonusCookie(value) {
+    try {
+      var cookieName = 'bonus_promo_applied';
+      var cookieValue = value ? 'true' : 'false';
+      var expires = new Date();
+      expires.setTime(expires.getTime() + (24 * 60 * 60 * 1000)); // 24 години
+      
+      document.cookie = cookieName + '=' + cookieValue + '; expires=' + expires.toUTCString() + '; path=/; SameSite=Lax';
+      log('Cookie встановлено:', { cookieName: cookieName, cookieValue: cookieValue });
+    } catch (e) {
+      logError('Помилка встановлення cookie', e);
+    }
+  }
+  
+  function getBonusCookie() {
+    try {
+      var name = 'bonus_promo_applied=';
+      var decodedCookie = decodeURIComponent(document.cookie);
+      var ca = decodedCookie.split(';');
+      for (var i = 0; i < ca.length; i++) {
+        var c = ca[i];
+        while (c.charAt(0) === ' ') {
+          c = c.substring(1);
+        }
+        if (c.indexOf(name) === 0) {
+          return c.substring(name.length, c.length) === 'true';
+        }
+      }
+    } catch (e) {
+      logError('Помилка читання cookie', e);
+    }
+    return false;
+  }
+
   function checkBonusPromoWithRetry(maxAttempts, delay) {
     log('Початок перевірки бонусного промокоду з повторами', { maxAttempts: maxAttempts, delay: delay });
     function attemptCheck(attempt) {
       log('Спроба перевірки #' + attempt);
       if (isBonusPromoCodeApplied()) {
         log('Бонусний промокод знайдено - застосовуємо дії');
-        instantTextReplace();
+        setBonusCookie(true); // Встановлюємо cookie для Cloudflare Worker
         ensurePhoneLockState();
         disableProductRemoval();
         return;
@@ -478,6 +472,7 @@
         var wasBonusPromo = isBonusPromoCodeApplied();
         waitForPromoCodeRemoval().then(function() {
           if (wasBonusPromo) {
+            setBonusCookie(false); // Очищуємо cookie для Cloudflare Worker
             enablePhoneInput();
             enableProductRemoval();
             resetBonusState();
@@ -670,8 +665,8 @@
         'ru': '🎁 Проверяем бонусы...'
       },
       'bonuses_available': {
-        'uk': '🎁 У вас є <span style="color: #28a745; font-weight: bold;">' + amount + '</span> бонусів. Хочете використати?',
-        'ru': '🎁 У вас есть <span style="color: #28a745; font-weight: bold;">' + amount + '</span> бонусов. Хотите использовать?'
+        'uk': '🎁 У мене є бонуси - <span style="color: #28a745; font-weight: bold;">' + amount + '</span> грн',
+        'ru': '🎁 У меня есть бонусы - <span style="color: #28a745; font-weight: bold;">' + amount + '</span> грн'
       },
       'bonuses_unavailable': {
         'uk': '🎁 Бонуси недоступні',
@@ -1321,17 +1316,7 @@
     });
   }
 
-  function waitForCertificateTextAndReplace() {
-    var language = getCurrentLanguage();
-    var certificateText = language === 'ru' ? 'Подарочный сертификат' : 'Подарунковий сертифікат';
-    
-    waitForElementWithCondition(
-      CERTIFICATE_SELECTORS.join(','), 
-      function(el) { return el.textContent && el.textContent.includes(certificateText); },
-      3000
-    ).then(instantTextReplace).catch(function() {
-    });
-  }
+
 
   function applyPromoCodeToForm(promoCode) {
     log('Застосування промокоду до форми', { promoCode: promoCode });
@@ -1353,7 +1338,6 @@
         setTimeout(function() {
           log('Налаштування слухача видалення промокоду');
           setupPromoCodeRemovalListener();
-          waitForCertificateTextAndReplace();
           checkBonusPromoWithRetry(5, 500);
           
           // Додаткова перевірка через більший час для надійності
@@ -1391,6 +1375,7 @@
 
   function restoreAfterError(errorMessage) {
     resetBonusState();
+    setBonusCookie(false); // Очищуємо cookie при помилці
     showPromoCode();
     setTimeout(function() {
       initializeCheckoutPage();
@@ -1472,7 +1457,15 @@
         if (document.querySelector('#bonus-block')) {
             removeBonusBlock();
         }
-        instantTextReplace();
+        return;
+      }
+
+      // Перевіряємо чи застосований звичайний промокод
+      if (isRegularPromoCodeApplied()) {
+        log('Звичайний промокод застосовано - не створюємо блок бонусів');
+        if (document.querySelector('#bonus-block')) {
+            removeBonusBlock();
+        }
         return;
       }
 
@@ -1527,10 +1520,8 @@
   function handleMutations(groupedMutations) {
     var lastBonusBlockCheck = 0;
     var lastElementsStateCheck = 0;
-    var lastTextReplace = 0;
     
     var shouldCheckBonusBlock = false;
-    var shouldReplaceText = false;
     var shouldCheckElementsState = false;
     var shouldSetupPromoListener = false;
     
@@ -1552,15 +1543,10 @@
         }
         
         // Перевіряємо додані вузли
-        if (!shouldCheckBonusBlock || !shouldReplaceText || !shouldCheckElementsState || !shouldSetupPromoListener) {
+        if (!shouldCheckBonusBlock || !shouldCheckElementsState || !shouldSetupPromoListener) {
           for (var k = 0; k < mutation.addedNodes.length; k++) {
             var node = mutation.addedNodes[k];
             if (node.nodeType === 1) {
-              // Перевірка для заміни тексту
-              if (!shouldReplaceText && node.textContent && node.textContent.includes('Подарунковий сертифікат') && !node.closest('#bonus-block')) {
-                shouldReplaceText = true;
-              }
-              
               // Перевірка для видалення промокоду
               if (!shouldSetupPromoListener && ((node.matches && node.matches('.j-coupon-remove')) || (node.querySelector && node.querySelector('.j-coupon-remove')))) {
                 shouldSetupPromoListener = true;
@@ -1585,7 +1571,7 @@
                 shouldCheckElementsState = true;
               }
               
-              if (shouldReplaceText && shouldCheckElementsState && shouldCheckBonusBlock && shouldSetupPromoListener) break;
+              if (shouldCheckElementsState && shouldCheckBonusBlock && shouldSetupPromoListener) break;
             }
           }
         }
@@ -1606,18 +1592,6 @@
     }
     
     // Виконуємо дії лише якщо є необхідність
-    if (shouldReplaceText) {
-      var now = Date.now();
-      if (now - lastTextReplace > 100) {
-        lastTextReplace = now;
-        setTimeout(function() {
-          log('Заміна тексту через централізований MutationObserver');
-          instantTextReplace();
-          ensurePhoneLockState();
-        }, 10);
-      }
-    }
-    
     if (shouldSetupPromoListener) {
       setTimeout(setupPromoCodeRemovalListener, 50);
     }
@@ -1654,8 +1628,11 @@
     var isBonusApplied = isBonusPromoCodeApplied();
     if (isBonusApplied) {
         log('Бонусний промокод застосовано при ініціалізації');
-        instantTextReplace();
+        setBonusCookie(true); // Встановлюємо cookie для Cloudflare Worker
         ensurePhoneLockState();
+    } else {
+        // Очищуємо cookie якщо бонуси не застосовані
+        setBonusCookie(false);
     }
 
     // Видаляємо ініціалізацію власного observer - тепер використовуємо централізований
@@ -1688,6 +1665,7 @@
   function destroyBonusSystem() {
     log('Знищення модуля бонусної системи для checkout');
     // Очищення ресурсів, обробників подій тощо
+    setBonusCookie(false); // Очищуємо cookie при знищенні
     bonusState = {
       promoApplied: false,
       promoType: null,
@@ -1700,7 +1678,6 @@
       inputValue: "",
       blockRemovedIntentionally: false,
       currentPageUrl: window.location.href,
-      textReplaced: false,
       elementsDisabled: false,
       disabledOpacity: '1'
     };
@@ -1709,16 +1686,19 @@
   log('Завантаження збереженого стану');
   loadBonusState();
   
+  // Модуль для експорту
+  var bonusCheckoutModule = {
+    init: function() {
+      log('Ініціалізація модуля через централізований менеджер');
+      initBonusSystem();
+    },
+    handleMutations: handleMutations,
+    destroy: destroyBonusSystem
+  };
+  
   // Експортуємо модуль для централізованого менеджера
-  if (typeof window.moduleExports === 'undefined') {
-    window.moduleExports = {
-      init: function() {
-        log('Ініціалізація модуля через централізований менеджер');
-        initBonusSystem();
-      },
-      handleMutations: handleMutations,
-      destroy: destroyBonusSystem
-    };
+  if (typeof moduleExports !== 'undefined') {
+    Object.assign(moduleExports, bonusCheckoutModule);
   }
   
   // Якщо скрипт завантажується самостійно (не через менеджер)
@@ -1726,5 +1706,8 @@
     log('Самостійний запуск модуля бонусної системи');
     initBonusSystem();
   }
+
+  // Повертаємо модуль
+  return bonusCheckoutModule;
 
 })();

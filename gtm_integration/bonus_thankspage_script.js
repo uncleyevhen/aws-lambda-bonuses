@@ -505,7 +505,14 @@
   }
   
   // Експортуємо модуль для централізованого менеджера
-  if (typeof window.moduleExports === 'undefined') {
+  if (typeof moduleExports !== 'undefined') {
+    // Запуск через централізований менеджер скриптів
+    moduleExports.init = initThankYouPage;
+    moduleExports.handleMutations = handleMutations;
+    moduleExports.destroy = destroyThankYouPage;
+    log('Модуль експортовано для централізованого менеджера');
+  } else if (typeof window.moduleExports === 'undefined') {
+    // Резервний експорт для старої версії
     window.moduleExports = {
       init: initThankYouPage,
       handleMutations: handleMutations,

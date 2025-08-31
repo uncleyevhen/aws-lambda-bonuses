@@ -10,17 +10,24 @@
 
 (function() {
   /******************** ГЛОБАЛЬНА КОНФІГУРАЦІЯ ********************/ 
-  var DEBUG_MODE = true;
+  var DEBUG_MODE = true;  // УВІМКНУТО для перевірки швидкої загрузки
   var LOG_PREFIX = '[SCRIPT_MANAGER]';
   
-  // Таймінги для оптимізації
-  var OBSERVER_THROTTLE = 100;  // мс між обробками мутацій
-  var PAGE_CHECK_TIMEOUT = 5000; // мс очікування елементів сторінки
-  var SCRIPT_INIT_DELAY = 50;   // мс затримки ініціалізації скриптів
+  // Таймінги для максимальної швидкості
+  var OBSERVER_THROTTLE = 100;  // Повертаємо до 100мс для швидкої реакції
+  var PAGE_CHANGE_DEBOUNCE = 200; // Зменшуємо затримку зміни сторінки
   
   // Базова URL для завантаження скриптів
   var SCRIPTS_BASE_URL = 'https://safeyourlove.com/';
-  var SCRIPT_CACHE_TTL = 3600000; // 1 година в мс
+  var SCRIPT_CACHE_TTL = 7200000; // 2 години в мс - збільшуємо кеш
+  
+    // Конфігурація відключених скриптів
+  var DISABLED_SCRIPTS = {
+    // 'text-replacer': true,        // ВІДКЛЮЧЕНО - заміна тексту тепер на рівні Cloudflare CDN!
+    // 'online-payment': true,   // Увімкнено - потрібно на checkout
+    // 'sms-notifications': true,   // Тимчасово відключено - не потрібно на checkout
+    // 'free-delivery-calculator': false,    // УВІМКНЕНО - новий калькулятор безкоштовної доставки
+  };
 
   /******************** ЛОГУВАННЯ ********************/ 
   function log(msg, data) {
@@ -120,12 +127,14 @@
     },
     
     _fetchAndParseScript: function(url) {
-      log('Завантаження скрипта', { url: url });
+      log('Швидке завантаження скрипта', { url: url });
       
       return fetch(url, {
         method: 'GET',
-        cache: 'default',
-        credentials: 'omit'
+        cache: 'force-cache', // Агресивне кешування для швидкості
+        credentials: 'omit',
+        mode: 'cors',
+        priority: 'high' // Високий пріоритет для fetch
       })
       .then(function(response) {
         if (!response.ok) {
@@ -137,13 +146,13 @@
         return this._parseScriptModule(scriptText, url);
       }.bind(this))
       .then(function(moduleFactory) {
-        // Додаємо до кешу
-        ScriptCache.set(url, moduleFactory);
-        log('Скрипт завантажено і розпарсено', { url: url });
+        // Додаємо до кешу з довшим TTL
+        ScriptCache.set(url, moduleFactory, SCRIPT_CACHE_TTL);
+        log('Скрипт швидко завантажено і розпарсено', { url: url });
         return moduleFactory;
       })
       .catch(function(error) {
-        logError('Помилка завантаження скрипта ' + url, error);
+        logError('Помилка швидкого завантаження скрипта ' + url, error);
         throw error;
       });
     },
@@ -173,11 +182,14 @@
         // Створюємо фабрику модулів
         return function() {
           if (typeof moduleExports === 'function') {
+            log('Модуль експортує функцію', { url: url });
             return moduleExports();
           } else if (typeof moduleExports === 'object' && moduleExports !== null) {
+            log('Модуль експортує об\'єкт', { url: url, keys: Object.keys(moduleExports) });
             return moduleExports;
           } else {
             // Якщо скрипт не експортує модуль, створюємо базовий
+            log('Модуль не експортує нічого, створюємо базовий', { url: url, moduleExports: moduleExports });
             return this._createBasicModule(url);
           }
         }.bind(this);
@@ -268,6 +280,15 @@
         elements: ['.invoice', '.order-details__total'],
         priority: 1
       },
+      'cart-modal': {
+        // Модальний кошик має найвищий пріоритет, бо може з'являтися поверх будь-якої сторінки
+        modal: true,
+        modalSelectors: ['#modal-overlay #cart.popup.__cart', '#cart.popup.__cart[style*="display: block"]'],
+        elements: ['.cart-items', '.cart-content', '.popup-title', '.j-total-sum'],
+        contentElements: ['.cart-item', '.j-cart-product', '.cart-summary'],
+        priority: 0, // Найвищий пріоритет
+        description: 'Модальне вікно кошика'
+      },
       'cart': {
         url: /\/cart/,
         elements: ['.cart-item', '.cart-total', '.order-summary'],
@@ -290,17 +311,84 @@
       }
     },
 
+    detectModalPage: function() {
+      // Перевіряємо всі правила модальних сторінок
+      for (var pageType in this.rules) {
+        var rule = this.rules[pageType];
+        
+        if (!rule.modal) continue;
+        
+        // Перевіряємо селектори модального вікна
+        var modalVisible = false;
+        if (rule.modalSelectors) {
+          for (var i = 0; i < rule.modalSelectors.length; i++) {
+            var modalElement = document.querySelector(rule.modalSelectors[i]);
+            if (modalElement) {
+              // Перевіряємо чи модальне вікно дійсно видиме
+              var style = window.getComputedStyle(modalElement);
+              var isVisible = style.display !== 'none' && 
+                             style.visibility !== 'hidden' && 
+                             modalElement.offsetWidth > 0 && 
+                             modalElement.offsetHeight > 0;
+              
+              if (isVisible) {
+                modalVisible = true;
+                break;
+              }
+            }
+          }
+        }
+        
+        if (!modalVisible) {
+          continue;
+        }
+        
+        // Якщо модальне вікно видиме, перевіряємо контент
+        var contentScore = 0;
+        
+        // Перевіряємо основні елементи
+        if (rule.elements) {
+          var elementsFound = rule.elements.filter(function(selector) {
+            return document.querySelector(selector) !== null;
+          });
+          contentScore += elementsFound.length * 5;
+        }
+        
+        // Перевіряємо елементи контенту
+        if (rule.contentElements) {
+          var contentElementsFound = rule.contentElements.filter(function(selector) {
+            return document.querySelector(selector) !== null;
+          });
+          contentScore += contentElementsFound.length * 3;
+        }
+        
+        // Якщо модальне вікно видиме і має достатньо контенту, повертаємо тип
+        if (contentScore >= 10) {
+          return pageType;
+        }
+      }
+      
+      return null;
+    },
+
     detect: function() {
       var url = window.location.href;
       var pathname = window.location.pathname;
       
-      log('Детекція типу сторінки', { url: url, pathname: pathname });
+      // Спочатку перевіряємо модальні вікна (найвищий пріоритет)
+      var modalPageType = this.detectModalPage();
+      if (modalPageType) {
+        return modalPageType;
+      }
 
       var candidates = [];
 
-      // Збираємо всі потенційні кандидати
+      // Збираємо всі потенційні кандидати (виключаючи модальні сторінки)
       for (var pageType in this.rules) {
         var rule = this.rules[pageType];
+        
+        // Пропускаємо модальні сторінки - вони обробляються окремо
+        if (rule.modal) continue;
         var score = 0;
         var matchReason = '';
         
@@ -338,7 +426,6 @@
       }
       
       if (candidates.length === 0) {
-        log('Тип сторінки визначено', { type: 'other', reason: 'no_matches' });
         return 'other';
       }
       
@@ -349,12 +436,6 @@
       });
       
       var winner = candidates[0];
-      log('Тип сторінки визначено', { 
-        type: winner.type, 
-        score: winner.score,
-        reason: winner.matchReason,
-        allCandidates: candidates 
-      });
       
       return winner.type;
     }
@@ -469,21 +550,21 @@
         priority: 1,
         description: 'Бонусна система для сторінки подяки після замовлення'
       },
-      // Універсальний бонусний скрипт (легка версія для інших сторінок)
-      'bonus-universal': {
-        pages: ['other', 'cart', 'product', 'category', 'home'],
-        url: SCRIPTS_BASE_URL + 'bonus_unified_script.js',
-        module: null,
-        priority: 1,
-        description: 'Легка версія бонусної системи для всіх інших сторінок'
-      },
-      // Перевірка безкоштовної доставки
-      'free-delivery': {
-        pages: ['checkout-main', 'cart'],
+      // Перевірка безкоштовної доставки (тимчасово відключено - 404)
+      /*'free-delivery': {
+        pages: ['checkout-main', 'cart', 'cart-modal'],
         url: SCRIPTS_BASE_URL + 'free_delivery_checker.js',
         module: null,
         priority: 2,
         description: 'Перевірка умов безкоштовної доставки'
+      },*/
+      // Новий калькулятор безкоштовної доставки (від 3000 грн)
+      'free-delivery-calculator': {
+        pages: ['checkout-main', 'cart', 'cart-modal'],
+        url: SCRIPTS_BASE_URL + 'free_delivery_calculator.js',
+        module: null,
+        priority: 2,
+        description: 'Калькулятор безкоштовної доставки від 3000 грн (укр/рос мови)'
       },
       // SMS функціонал
       'sms-notifications': {
@@ -495,11 +576,19 @@
       },
       // Онлайн платежі
       'online-payment': {
-        pages: ['checkout-main'],
+        pages: ['checkout-complete'],
         url: SCRIPTS_BASE_URL + 'online_payment.js',
         module: null,
         priority: 2,
         description: 'Обробка онлайн платежів'
+      },
+      // Заміна тексту промокодів на бонуси - ПЕРЕНЕСЕНО НА CLOUDFLARE CDN!
+      'text-replacer': {
+        pages: ['checkout-main', 'checkout-complete', 'cart', 'cart-modal'],
+        url: SCRIPTS_BASE_URL + 'bonus_text_replacer_script.js',
+        module: null,
+        priority: 0, // Найвищий пріоритет - але ВІДКЛЮЧЕНО через Cloudflare
+        description: '⚡ Заміна тексту "Промокод/Сертифікат" на "Бонуси" (ПРАЦЮЄ НА CLOUDFLARE CDN)'
       }
     },
 
@@ -514,6 +603,9 @@
       // Визначаємо тип сторінки
       this.currentPageType = PageDetector.detect();
       
+      // ПРЕВЕНТИВНЕ ЗАВАНТАЖЕННЯ критичних скриптів
+      this.preloadCriticalScripts();
+      
       // Завантажуємо і запускаємо відповідні скрипти
       this.loadPageScripts();
       
@@ -522,6 +614,28 @@
       
       this.initialized = true;
       log('Менеджер скриптів ініціалізовано', { pageType: this.currentPageType });
+    },
+
+    preloadCriticalScripts: function() {
+      // Список критичних скриптів які завантажуємо завжди
+      var criticalScripts = []; // Заміна тексту тепер на рівні Cloudflare!
+      
+      if (criticalScripts.length === 0) {
+        log('Критичні скрипти не потрібні - заміна тексту на рівні CDN');
+        return;
+      }
+      
+      log('Превентивне завантаження критичних скриптів', { scripts: criticalScripts });
+      
+      criticalScripts.forEach(function(scriptName) {
+        var config = this.scriptRegistry[scriptName];
+        if (config && !DISABLED_SCRIPTS[scriptName]) {
+          // Завантажуємо в кеш (але не запускаємо поки)
+          ScriptLoader.loadScript(config.url).catch(function(error) {
+            logError('Помилка превентивного завантаження скрипта ' + scriptName, error);
+          });
+        }
+      }.bind(this));
     },
 
     loadPageScripts: function() {
@@ -574,16 +688,30 @@
         return;
       }
       
-      // Завантажуємо скрипти з затримкою
+      // ШВИДКЕ ПАРАЛЕЛЬНЕ ЗАВАНТАЖЕННЯ - без затримок
       var loadPromises = [];
-      scriptsToLoad.forEach(function(scriptInfo, index) {
-        var promise = new Promise(function(resolve) {
-          setTimeout(function() {
-            this.loadScript(scriptInfo.name, scriptInfo.config)
-              .then(resolve)
-              .catch(resolve); // Не блокуємо інші скрипти при помилці
-          }.bind(this), SCRIPT_INIT_DELAY * index);
-        }.bind(this));
+      
+      // Розділяємо скрипти на критичні та звичайні
+      var criticalScripts = scriptsToLoad.filter(function(s) { return s.config.priority <= 1; });
+      var normalScripts = scriptsToLoad.filter(function(s) { return s.config.priority > 1; });
+      
+      // Спочатку завантажуємо всі критичні скрипти ОДНОЧАСНО
+      criticalScripts.forEach(function(scriptInfo) {
+        var promise = this.loadScript(scriptInfo.name, scriptInfo.config)
+          .catch(function(error) {
+            logError('Помилка завантаження критичного скрипта ' + scriptInfo.name, error);
+            return null; // Не блокуємо інші скрипти
+          });
+        loadPromises.push(promise);
+      }.bind(this));
+      
+      // Звичайні скрипти також завантажуємо одночасно
+      normalScripts.forEach(function(scriptInfo) {
+        var promise = this.loadScript(scriptInfo.name, scriptInfo.config)
+          .catch(function(error) {
+            logError('Помилка завантаження скрипта ' + scriptInfo.name, error);
+            return null; // Не блокуємо інші скрипти
+          });
         loadPromises.push(promise);
       }.bind(this));
       
@@ -599,31 +727,81 @@
     },
 
     shouldLoadScript: function(scriptName, scriptConfig, pageType) {
+      // Перевіряємо чи скрипт відключений глобально
+      if (DISABLED_SCRIPTS[scriptName]) {
+        log('Скрипт відключений через конфігурацію', { script: scriptName });
+        return false;
+      }
+      
       // Логіка для визначення чи потрібно завантажувати скрипт
       
       // Для checkout-main - не завантажуємо універсальні версії
       if (pageType === 'checkout-main') {
-        if (scriptName === 'bonus-universal') {
+        if (scriptName === 'bonus-universal' || scriptName === 'bonus-cart-modal') {
           return false; // Використовуємо повнофункціональний bonus-checkout
         }
       }
       
       // Для checkout-complete - не завантажуємо checkout скрипти
       if (pageType === 'checkout-complete') {
-        if (scriptName === 'bonus-checkout' || scriptName === 'bonus-universal') {
+        if (scriptName === 'bonus-checkout' || scriptName === 'bonus-universal' || scriptName === 'bonus-cart-modal') {
           return false; // Використовуємо тільки bonus-thankyou
+        }
+        // SMS для thank you сторінки не потрібні
+        if (scriptName === 'sms-notifications') {
+          return false;
+        }
+      }
+      
+      // Для модального кошика - використовуємо спеціалізований скрипт
+      if (pageType === 'cart-modal') {
+        if (scriptName === 'bonus-checkout' || scriptName === 'bonus-thankyou' || scriptName === 'bonus-universal') {
+          return false; // Використовуємо bonus-cart-modal
+        }
+        // Для модального кошика не завантажуємо SMS і онлайн платежі
+        if (['sms-notifications', 'online-payment'].includes(scriptName)) {
+          return false;
+        }
+        // Тимчасово відключаємо bonus-cart-modal поки файл не існує
+        if (scriptName === 'bonus-cart-modal') {
+          return false;
+        }
+      }
+      
+      // Для звичайної сторінки кошика - не завантажуємо модальну версію
+      if (pageType === 'cart') {
+        if (scriptName === 'bonus-cart-modal') {
+          return false; // Використовуємо bonus-universal для звичайної сторінки кошика
         }
       }
       
       // Для інших сторінок - використовуємо тільки universal версії
-      if (['other', 'cart', 'product', 'category', 'home'].includes(pageType)) {
-        if (scriptName === 'bonus-checkout' || scriptName === 'bonus-thankyou') {
+      if (['other', 'product', 'category', 'home'].includes(pageType)) {
+        if (scriptName === 'bonus-checkout' || scriptName === 'bonus-thankyou' || scriptName === 'bonus-cart-modal') {
           return false; // Використовуємо bonus-universal
         }
         // Не завантажуємо checkout-специфічні скрипти на інших сторінках
-        if (['free-delivery', 'sms-notifications', 'online-payment'].includes(scriptName)) {
+        if (['sms-notifications', 'online-payment'].includes(scriptName)) {
           return false;
         }
+        // Тимчасово відключаємо bonus-universal поки файл не існує
+        if (scriptName === 'bonus-universal') {
+          return false;
+        }
+      }
+      
+      // text-replacer завантажуємо на всіх сторінках де є бонусна система
+      if (scriptName === 'text-replacer') {
+        // Завантажуємо тільки на сторінках де є форми з промокодами/бонусами
+        var supportedPages = ['checkout-main', 'checkout-complete', 'cart', 'cart-modal'];
+        return supportedPages.includes(pageType);
+      }
+      
+      // free-delivery-calculator завантажуємо на сторінках з кошиком та checkout
+      if (scriptName === 'free-delivery-calculator') {
+        // Завантажуємо на сторінках де показується сума замовлення
+        var supportedPages = ['checkout-main', 'cart', 'cart-modal'];
+        return supportedPages.includes(pageType);
       }
       
       return true;
@@ -632,6 +810,17 @@
     loadScript: function(scriptName, config) {
       if (this.scripts.has(scriptName)) {
         log('Скрипт вже завантажено', { script: scriptName });
+        return Promise.resolve();
+      }
+      
+      if (!config || !config.url) {
+        logError('Невірна конфігурація скрипта', { scriptName: scriptName, config: config });
+        return Promise.reject(new Error('Невірна конфігурація скрипта: ' + scriptName));
+      }
+      
+      // Перевіряємо чи скрипт не відключений
+      if (DISABLED_SCRIPTS[scriptName]) {
+        log('Скрипт пропущено - відключений', { script: scriptName });
         return Promise.resolve();
       }
       
@@ -653,6 +842,20 @@
               // Ініціалізуємо скрипт
               if (typeof scriptModule.init === 'function') {
                 scriptModule.init();
+              }
+              
+              // Спеціальна логіка для калькулятора безкоштовної доставки
+              if (scriptName === 'free-delivery-calculator') {
+                // Калькулятор має власну автоініціалізацію через window.FreeDeliveryCalculator
+                if (window.FreeDeliveryCalculator && typeof window.FreeDeliveryCalculator.init === 'function') {
+                  if (!window.FreeDeliveryCalculator.isInitialized()) {
+                    window.FreeDeliveryCalculator.init();
+                    log('Free delivery calculator ініціалізовано через window API');
+                  }
+                } else {
+                  // Якщо немає window API, можливо скрипт ініціалізується автоматично
+                  log('Free delivery calculator завантажено (автоініціалізація)');
+                }
               }
               
               // Реєструємо обробник мутацій якщо є
@@ -677,9 +880,15 @@
       // Слухаємо зміни URL для SPA
       var originalPushState = history.pushState;
       var originalReplaceState = history.replaceState;
+      var pageChangeTimeout = null;
       
       var handlePageChange = function() {
-        setTimeout(function() {
+        // Дебаунс для зміни сторінки
+        if (pageChangeTimeout) {
+          clearTimeout(pageChangeTimeout);
+        }
+        
+        pageChangeTimeout = setTimeout(function() {
           var newPageType = PageDetector.detect();
           if (newPageType !== this.currentPageType) {
             log('Зміна типу сторінки', { 
@@ -688,7 +897,8 @@
             });
             this.handlePageChange(newPageType);
           }
-        }.bind(this), 100);
+          pageChangeTimeout = null;
+        }.bind(this), PAGE_CHANGE_DEBOUNCE);
       }.bind(this);
       
       history.pushState = function() {
@@ -702,6 +912,88 @@
       };
       
       window.addEventListener('popstate', handlePageChange);
+      
+      // Додаємо обробку модальних вікон
+      this.setupModalDetection();
+    },
+
+    setupModalDetection: function() {
+      var modalCheckTimeout = null;
+      var lastModalState = null;
+      
+      // Спостерігаємо за змінами в DOM для виявлення модальних вікон
+      var modalObserver = new MutationObserver(function(mutations) {
+        var shouldCheckModal = false;
+        
+        mutations.forEach(function(mutation) {
+          // Перевіряємо зміни атрибутів style (display, visibility)
+          if (mutation.type === 'attributes' && 
+              (mutation.attributeName === 'style' || mutation.attributeName === 'class')) {
+            var target = mutation.target;
+            if (target.id === 'modal-overlay' || 
+                target.id === 'cart' || 
+                target.classList.contains('popup') ||
+                target.classList.contains('overlay')) {
+              shouldCheckModal = true;
+            }
+          }
+          
+          // Перевіряємо додавання/видалення вузлів
+          if (mutation.type === 'childList') {
+            var addedNodes = Array.from(mutation.addedNodes);
+            var removedNodes = Array.from(mutation.removedNodes);
+            
+            addedNodes.concat(removedNodes).forEach(function(node) {
+              if (node.nodeType === 1) { // Element node
+                if (node.id === 'modal-overlay' || 
+                    node.id === 'cart' ||
+                    node.classList.contains('popup') ||
+                    node.classList.contains('overlay') ||
+                    node.querySelector('#modal-overlay, #cart, .popup, .overlay')) {
+                  shouldCheckModal = true;
+                }
+              }
+            });
+          }
+        });
+        
+        if (shouldCheckModal) {
+          // Дебаунс для модальних вікон
+          if (modalCheckTimeout) {
+            clearTimeout(modalCheckTimeout);
+          }
+          
+          modalCheckTimeout = setTimeout(function() {
+            var newPageType = PageDetector.detect();
+            
+            // Перевіряємо чи дійсно змінився стан модального вікна
+            var currentModalState = newPageType === 'cart-modal';
+            if (currentModalState !== lastModalState && newPageType !== this.currentPageType) {
+              log('Модальне вікно змінилося', { 
+                from: this.currentPageType, 
+                to: newPageType,
+                modalState: currentModalState
+              });
+              this.handlePageChange(newPageType);
+            }
+            lastModalState = currentModalState;
+            modalCheckTimeout = null;
+          }.bind(this), PAGE_CHANGE_DEBOUNCE);
+        }
+      }.bind(this));
+      
+      // Спостерігаємо за всім документом
+      modalObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['style', 'class']
+      });
+      
+      // Зберігаємо посилання на observer для можливості його видалення
+      this.modalObserver = modalObserver;
+      
+      log('Налаштовано спостереження за модальними вікнами');
     },
 
     handlePageChange: function(newPageType) {
@@ -748,6 +1040,13 @@
     destroy: function() {
       this.destroyCurrentScripts();
       CentralObserver.destroy();
+      
+      // Знищуємо modal observer
+      if (this.modalObserver) {
+        this.modalObserver.disconnect();
+        this.modalObserver = null;
+      }
+      
       this.initialized = false;
       log('Менеджер скриптів знищено');
     }
@@ -768,6 +1067,7 @@
     },
     disableDebug: function() {
       DEBUG_MODE = false;
+      console.log(LOG_PREFIX + ' Debug режим вимкнено');
     },
     getStats: function() {
       return {
@@ -791,9 +1091,13 @@
           priority: config.priority,
           description: config.description,
           url: config.url,
-          loaded: ScriptManager.scripts.has(name)
+          loaded: ScriptManager.scripts.has(name),
+          disabled: !!DISABLED_SCRIPTS[name]
         };
       }
+      
+      // Інформація про відключені скрипти
+      stats.disabledScripts = this.getDisabledScripts();
       
       // Інформація про поточні активні скрипти
       stats.activeScriptDetails = {};
@@ -847,6 +1151,20 @@
     },
     clearCache: function() {
       ScriptCache.clear();
+      log('Кеш скриптів очищено');
+    },
+    
+    // Додаємо метод для ручного управління скриптами
+    enableMissingScripts: function() {
+      delete DISABLED_SCRIPTS['bonus-universal'];
+      delete DISABLED_SCRIPTS['bonus-cart-modal'];
+      log('Відключені скрипти увімкнено. Для застосування потрібно перезавантажити сторінку.');
+    },
+    
+    disableMissingScripts: function() {
+      DISABLED_SCRIPTS['bonus-universal'] = true;
+      DISABLED_SCRIPTS['bonus-cart-modal'] = true;
+      log('Відсутні скрипти вимкнено');
     },
     setScriptsBaseUrl: function(url) {
       SCRIPTS_BASE_URL = url.endsWith('/') ? url : url + '/';
@@ -906,6 +1224,44 @@
       }
       return false;
     },
+    // Керування відключеними скриптами
+    disableScript: function(scriptName) {
+      DISABLED_SCRIPTS[scriptName] = true;
+      log('Скрипт відключено', { script: scriptName });
+      
+      // Якщо скрипт зараз активний - зупиняємо його
+      if (ScriptManager.scripts.has(scriptName)) {
+        var scriptInfo = ScriptManager.scripts.get(scriptName);
+        CentralObserver.unregisterHandler(scriptName);
+        
+        if (scriptInfo.module && typeof scriptInfo.module.destroy === 'function') {
+          scriptInfo.module.destroy();
+        }
+        
+        ScriptManager.scripts.delete(scriptName);
+        log('Активний скрипт зупинено', { script: scriptName });
+      }
+    },
+    enableScript: function(scriptName) {
+      if (DISABLED_SCRIPTS[scriptName]) {
+        delete DISABLED_SCRIPTS[scriptName];
+        log('Скрипт увімкнено', { script: scriptName });
+        
+        // Якщо скрипт підходить для поточної сторінки - завантажуємо
+        var config = ScriptManager.scriptRegistry[scriptName];
+        if (config && config.pages.includes(ScriptManager.currentPageType)) {
+          ScriptManager.loadScript(scriptName, config);
+        }
+      }
+    },
+    getDisabledScripts: function() {
+      return Object.keys(DISABLED_SCRIPTS).filter(function(script) {
+        return DISABLED_SCRIPTS[script];
+      });
+    },
+    isScriptDisabled: function(scriptName) {
+      return !!DISABLED_SCRIPTS[scriptName];
+    },
     // Утилітарні методи для діагностики
     diagnose: function() {
       var issues = [];
@@ -924,7 +1280,7 @@
       var expectedScripts = [];
       for (var scriptName in ScriptManager.scriptRegistry) {
         var config = ScriptManager.scriptRegistry[scriptName];
-        if (config.pages.includes(ScriptManager.currentPageType)) {
+        if (config.pages.includes(ScriptManager.currentPageType) && !DISABLED_SCRIPTS[scriptName]) {
           expectedScripts.push(scriptName);
         }
       }
@@ -942,23 +1298,20 @@
         warnings: warnings,
         pageType: ScriptManager.currentPageType,
         expectedScripts: expectedScripts,
-        loadedScripts: loadedScripts
+        loadedScripts: loadedScripts,
+        disabledScripts: this.getDisabledScripts()
       };
     }
   };
 
-  /******************** АВТОЗАПУСК ********************/ 
-  // Автоматично ініціалізуємо менеджер
+  /******************** ШВИДКИЙ АВТОЗАПУСК ********************/ 
+  // МИТТЄВА ініціалізація менеджера без затримок
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function() {
-      setTimeout(function() {
-        ScriptManager.init();
-      }, 100);
+      ScriptManager.init(); // Прибираємо setTimeout - запускаємо миттєво
     });
   } else {
-    setTimeout(function() {
-      ScriptManager.init();
-    }, 100);
+    ScriptManager.init(); // Якщо DOM вже готовий - запускаємо негайно
   }
 
   // Cleanup при закритті сторінки
@@ -966,6 +1319,11 @@
     ScriptManager.destroy();
   });
 
-  log('Централізований менеджер скриптів завантажено');
+  log('Централізований менеджер скриптів завантажено (ШВИДКИЙ РЕЖИМ)', { 
+    debugMode: DEBUG_MODE,
+    observerThrottle: OBSERVER_THROTTLE + 'мс',
+    pageChangeDebounce: PAGE_CHANGE_DEBOUNCE + 'мс',
+    cacheTime: (SCRIPT_CACHE_TTL / 3600000) + ' годин'
+  });
 
 })();
