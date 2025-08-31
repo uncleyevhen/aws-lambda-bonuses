@@ -2,7 +2,7 @@
  * Калькулятор безкоштовної доставки для інтернет-магазину
  * Версія: 1.1
  * Безкоштовна доставка від 3000 грн
- * Підтримка української та російської мов
+ * Підтримка української, російської, польської та англійської мов
  */
 
 (function() {
@@ -113,7 +113,10 @@
      */
     function getCurrentLanguage() {
         var url = window.location.href;
-        return url.includes('/ru/') ? 'ru' : 'uk';
+        if (url.includes('/ru/')) return 'ru';
+        if (url.includes('/pl/')) return 'pl';
+        if (url.includes('/en/')) return 'en';
+        return 'uk';
     }
 
     /**
@@ -145,23 +148,37 @@
                     : `До безкоштовної доставки залишилось: ${remaining.toFixed(0)} ${CONFIG.CURRENCY}`,
                 'ru': isMobile 
                     ? `До бесплатной доставки осталось:`
-                    : `До бесплатной доставки осталось: ${remaining.toFixed(0)} ${CONFIG.CURRENCY}`
+                    : `До бесплатной доставки осталось: ${remaining.toFixed(0)} ${CONFIG.CURRENCY}`,
+                'pl': isMobile 
+                    ? `Do darmowej dostawy zostało:`
+                    : `Do darmowej dostawy zostało: ${remaining.toFixed(0)} ${CONFIG.CURRENCY}`,
+                'en': isMobile 
+                    ? `To free delivery left:`
+                    : `To free delivery left: ${remaining.toFixed(0)} ${CONFIG.CURRENCY}`
             },
             'free_shipping_mobile': {
                 'uk': `До безкоштовної доставки залишилось:`,
-                'ru': `До бесплатной доставки осталось:`
+                'ru': `До бесплатной доставки осталось:`,
+                'pl': `Do darmowej dostawy zostało:`,
+                'en': `To free delivery left:`
             },
             'free_shipping_desktop': {
                 'uk': `До безкоштовної доставки залишилось: ${remaining.toFixed(0)} ${CONFIG.CURRENCY}`,
-                'ru': `До бесплатной доставки осталось: ${remaining.toFixed(0)} ${CONFIG.CURRENCY}`
+                'ru': `До бесплатной доставки осталось: ${remaining.toFixed(0)} ${CONFIG.CURRENCY}`,
+                'pl': `Do darmowej dostawy zostało: ${remaining.toFixed(0)} ${CONFIG.CURRENCY}`,
+                'en': `To free delivery left: ${remaining.toFixed(0)} ${CONFIG.CURRENCY}`
             },
             'free_shipping_amount': {
                 'uk': `${remaining.toFixed(0)} ${CONFIG.CURRENCY}`,
-                'ru': `${remaining.toFixed(0)} ${CONFIG.CURRENCY}`
+                'ru': `${remaining.toFixed(0)} ${CONFIG.CURRENCY}`,
+                'pl': `${remaining.toFixed(0)} ${CONFIG.CURRENCY}`,
+                'en': `${remaining.toFixed(0)} ${CONFIG.CURRENCY}`
             },
             'free_shipping_achieved': {
                 'uk': '🎉 Безкоштовна доставка',
-                'ru': '🎉 Бесплатная доставка'
+                'ru': '🎉 Бесплатная доставка',
+                'pl': '🎉 Darmowa dostawa',
+                'en': '🎉 Free delivery'
             }
         };
         return translations[key] && translations[key][language] ? translations[key][language] : translations[key]['uk'];
