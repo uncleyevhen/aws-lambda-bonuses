@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import engine, Base
-from app.routers import webhooks, balance, promo
+from app.routers import webhooks, balance, promo, migration
 
 # Налаштування логування
 logging.basicConfig(
@@ -95,6 +95,11 @@ app.include_router(
     promo.router, 
     prefix="/promo", 
     tags=["Promo Codes"]
+)
+app.include_router(
+    migration.router, 
+    prefix="/migration", 
+    tags=["Migration"]
 )
 
 
