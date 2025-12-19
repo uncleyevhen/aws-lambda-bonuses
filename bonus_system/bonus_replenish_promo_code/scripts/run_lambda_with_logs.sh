@@ -1,12 +1,59 @@
 #!/bin/bash
 
-# Запуск Lambda функції з real-time логами через CloudWatch
+# Скрипт для запуску Lambda функції з логами
+# Включає перевірку блокування перед запуском
 
-FUNCTION_NAME="replenish-promo-code"
+set -e
+
+# Кольори для виводу
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Конфігурація
+FUNCTION_NAME="bonus-replenish-promo-prod"
+REGION="eu-north-1"
 LOG_GROUP="/aws/lambda/$FUNCTION_NAME"
+PAYLOAD_FILE="invoke_payload.json"
 
-echo "🚀 Запуск Lambda функції: $FUNCTION_NAME"
-echo "⏰ $(date)"
+echo -e "${BLUE}🚀 Запуск Lambda функції: $FUNCTION_NAME${NC}"
+echo -e "${BLUE}⏰ $(date)${NC}"
+echo ""
+
+# Перевірка статусу блокування перед запуском
+echo -e "${YELLOW}🔍 Перевірка статусу блокування...${NC}"
+if ./scripts/check_lock_status.sh > /dev/null 2>&1; then
+    # Перевіряємо чи функція заблокована
+    locked=$(aws lambda invoke 
+        --function-name "$FUNCTION_NAME" 
+        --region "$REGION" 
+        --payload 'file://lock_status_payload.json' 
+        temp_status.json && 
+        cat temp_status.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print('true' if data.get('locked', False) else 'false')
+except:
+    print('false')
+" 2>/dev/null || echo "false")
+    
+    rm -f temp_status.json
+    
+    if [ "$locked" = "true" ]; then
+        echo -e "${RED}🔒 Функція вже виконується іншим процесом!${NC}"
+        echo -e "${YELLOW}ℹ️  Для детальної інформації: ./scripts/check_lock_status.sh${NC}"
+        echo -e "${YELLOW}ℹ️  Для примусового розблокування: ./scripts/force_unlock.sh${NC}"
+        exit 1
+    else
+        echo -e "${GREEN}🔓 Функція доступна для запуску${NC}"
+    fi
+else
+    echo -e "${YELLOW}⚠️  Не вдалося перевірити статус блокування, продовжуємо...${NC}"
+fi
+
 echo ""
 
 # Отримуємо поточний час для фільтрації логів
@@ -17,7 +64,8 @@ echo "📡 Викликаємо функцію..."
 # Запускаємо функцію в фоновому режимі
 aws lambda invoke \
     --function-name "$FUNCTION_NAME" \
-    --payload '{}' \
+    --region "$AWS_REGION" \
+    --payload file://invoke_payload.json \
     --cli-binary-format raw-in-base64-out \
     response.json &
 

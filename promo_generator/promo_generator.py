@@ -75,7 +75,7 @@ CONFIG = {
     's3_bucket': 'lambda-promo-sessions',
     's3_key': 'promo-codes/available_codes.json',
     'region': 'eu-north-1',
-    'target_codes_per_amount': 5,
+    'target_codes_per_amount': 10,
     'start_amount': 1,      # Початкова сума для обробки
     'end_amount': 2000,        # Кінцева сума для обробки
     'sort_order': 'asc',  # Порядок сортування: 'asc' (зростання) або 'desc' (спадання)
@@ -540,8 +540,37 @@ def download_from_s3():
             logger.warning("Продовжуємо з порожньою базою промокодів")
             return {}
 
-def upload_to_s3(data):
-    """Завантажує дані в S3."""
+def save_to_local_file(data, filename=None):
+    """Зберігає дані в локальний JSON файл."""
+    try:
+        if filename is None:
+            # Створюємо ім'я файлу з timestamp
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            filename = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                f'promo_codes_{timestamp}.json'
+            )
+        
+        logger.info(f"💾 Збереження промокодів в локальний файл: {filename}")
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"✅ Промокоди збережено в файл: {filename}")
+        return filename
+
+    except Exception as e:
+        logger.error(f"❌ Помилка при збереженні в файл: {e}")
+        return None
+
+def upload_to_s3(data, save_local=True):
+    """Завантажує дані в S3 та опціонально зберігає локально."""
+    # Спочатку зберігаємо локально (якщо потрібно)
+    local_file = None
+    if save_local:
+        local_file = save_to_local_file(data)
+    
+    # Потім завантажуємо в S3
     try:
         import boto3
         s3 = boto3.client('s3', region_name=CONFIG['region'])
@@ -558,11 +587,15 @@ def upload_to_s3(data):
         )
         
         logger.info("✅ Промокоди успішно завантажено в S3")
+        if local_file:
+            logger.info(f"📁 Також збережено локально: {local_file}")
         return True
 
     except Exception as e:
         logger.error(f"❌ Помилка при завантаженні в S3: {e}")
         logger.error("Перевірте ваші AWS креданшали та налаштування")
+        if local_file:
+            logger.info(f"✅ Але промокоди збережено локально: {local_file}")
         return False
 
 def generate_random_string(length):

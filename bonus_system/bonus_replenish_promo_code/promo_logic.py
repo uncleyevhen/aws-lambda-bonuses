@@ -14,7 +14,7 @@
 """
 
 import time
-
+import logging
 import os
 import random
 import string
@@ -24,6 +24,23 @@ from datetime import datetime, timedelta
 from playwright.sync_api import Page
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
+
+# Контроль детальності логування
+VERBOSE_LOGGING = os.environ.get('VERBOSE_LOGGING', 'false').lower() == 'true'
+
+# Функція для умовного логування
+def log_verbose(message):
+    """Виводить детальні логи тільки якщо увімкнено VERBOSE_LOGGING"""
+    if VERBOSE_LOGGING:
+        print(message)
+
+def log_info(message):
+    """Виводить важливі логи завжди"""  
+    print(message)
+
+def log_error(message):
+    """Виводить помилки завжди"""
+    print(message)
 
 try:
     from .bon_utils import is_bon_promo_code, extract_amount_from_bon_code
@@ -213,13 +230,13 @@ class PromoService:
                         'calendar' in code.lower() or 
                         len(code) > 50 or  # Занадто довгі рядки - це не промокоди
                         not code.startswith('BON')):  # Промокоди повинні починатись з BON
-                        print(f"  📋 Рядок {i+4}: пропускаємо заголовок/не-промокод - '{code[:50]}...'")
+                        log_verbose(f"  📋 Рядок {i+4}: пропускаємо заголовок/не-промокод - '{code[:50]}...'")
                         skipped_rows += 1
                         continue
                     
                     # Пропускаємо рядки з порожніми значеннями
                     if not code.strip() or not status.strip():
-                        print(f"  ⚠️ Рядок {i+4}: пропускаємо - порожній код/статус")
+                        log_verbose(f"  ⚠️ Рядок {i+4}: пропускаємо - порожній код/статус")
                         skipped_rows += 1
                         continue
                     
@@ -228,19 +245,19 @@ class PromoService:
                     
                     if is_active:
                         active_codes.append(code)
-                        print(f"  ✅ Активний код '{code}' (рядок {i+4})")
+                        log_verbose(f"  ✅ Активний код '{code}' (рядок {i+4})")
                     else:
                         inactive_codes_to_delete.append(code)
-                        print(f"  ❌ Неактивний код '{code}' (статус: '{status}') буде видалено (рядок {i+4})")
+                        log_verbose(f"  ❌ Неактивний код '{code}' (статус: '{status}') буде видалено (рядок {i+4})")
                     
                     processed_rows += 1
                         
                 except Exception as e:
-                    print(f"⚠️ Помилка при обробці рядка {i}: {e}")
+                    log_error(f"⚠️ Помилка при обробці рядка {i}: {e}")
                     skipped_rows += 1
                     continue
             
-            print(f"📊 Результат аналізу для суми {amount}:")
+            log_info(f"📊 Результат аналізу для суми {amount}:")
             print(f"   📋 Всього рядків в таблиці: {total_rows}")
             print(f"   ✅ Оброблено рядків: {processed_rows}")
             print(f"   ⚠️ Пропущено рядків: {skipped_rows}")
@@ -325,42 +342,43 @@ class PromoService:
                                 print("❌ Не вдалося знайти способ видалення")
                                 return active_codes, []
                         
-                        # Очікуємо появи діалогу підтвердження
-                        print("⏳ Очікуємо появи діалогу підтвердження...")
+                        # Очікуємо появи діалогу підтвердження (швидше)
+                        log_verbose("⏳ Очікуємо появи діалогу підтвердження...")
                         import time
-                        time.sleep(1.5)
                         
-                        # Перевіряємо, чи був оброблений стандартний діалог
-                        if dialog_handled:
-                            print("✅ Стандартний діалог оброблено, операція має завершитись")
-                        else:
-                            # Шукаємо модальне вікно підтвердження
-                            print("🔍 Стандартний діалог не з'явився, шукаємо модальне вікно...")
-                            
-                            confirm_selectors = [
-                                '.confirm-modal__button--ok',
-                                'button:has-text("Підтвердити")',
-                                'button:has-text("Так")',
-                                'button:has-text("OK")',
-                                '#dialog-window .confirm-modal__button--ok',
-                                '.modal-footer button.btn-primary',
-                                '.ui-dialog-buttonset button:first-child',
-                                'button[onclick*="confirm"]',
-                                '.dialog-confirm-button'
-                            ]
-                            
-                            button_found = False
+                        # Шукаємо модальне вікно одразу, без зайвого чекання
+                        confirm_selectors = [
+                            '.confirm-modal__button--ok',
+                            'button:has-text("Підтвердити")',
+                            'button:has-text("Так")', 
+                            'button:has-text("OK")',
+                            '#dialog-window .confirm-modal__button--ok',
+                            '.modal-footer button.btn-primary',
+                            '.ui-dialog-buttonset button:first-child',
+                            'button[onclick*="confirm"]',
+                            '.dialog-confirm-button'
+                        ]
+                        
+                        button_found = False
+                        # Спробуємо знайти кнопку протягом 3 секунд (замість фіксованого sleep)
+                        for attempt in range(6):  # 6 спроб по 0.5 секунди
                             for selector in confirm_selectors:
                                 confirm_buttons = frame.locator(selector)
                                 if confirm_buttons.count() > 0:
-                                    print(f"✅ Знайдено кнопку підтвердження: {selector}")
+                                    log_info(f"✅ Знайдено кнопку підтвердження: {selector}")
                                     confirm_buttons.first.click()
-                                    print("🎯 Кнопку підтвердження натиснуто!")
+                                    log_info("🎯 Кнопку підтвердження натиснуто!")
                                     button_found = True
-                                    time.sleep(0.5)
                                     break
                             
-                            if not button_found:
+                            if button_found:
+                                break
+                            time.sleep(0.5)
+                        
+                        # Перевіряємо, чи був оброблений стандартний діалог
+                        if dialog_handled:
+                            log_verbose("✅ Стандартний діалог оброблено, операція має завершитись")
+                        elif not button_found:
                                 print("⌨️ Кнопка підтвердження не знайдена, пробуємо Enter та JavaScript...")
                                 
                                 # Спроба 1: Enter на iframe
@@ -507,8 +525,15 @@ class PromoService:
             
             # Якщо активних кодів достатньо або більше - НЕ ОНОВЛЮЄМО S3 для цієї суми
             if len(active_codes) >= target_codes_per_amount:
-                print(f"✅ [Smart] Для суми {amount} достатньо активних кодів ({len(active_codes)} >= {target_codes_per_amount}), залишаємо як є в S3")
+                log_info(f"✅ [Smart] Для суми {amount} достатньо активних кодів ({len(active_codes)} >= {target_codes_per_amount}), залишаємо як є в S3")
                 updated_codes[amount_key] = active_codes
+                
+                # Очищаємо лічільник використаних кодів навіть якщо не створювали нові коди
+                # Це запобігає повторним перевіркам цієї суми у майбутніх запусках
+                if self.clear_used_codes_count(amount):
+                    log_info(f"🗑️ [Smart] Лічільник використаних кодів для суми {amount} очищено (достатньо кодів)")
+                else:
+                    log_error(f"⚠️ [Smart] Не вдалося очистити лічільник для суми {amount}")
                 continue
             
             # Якщо кодів не достатньо - створюємо нові до цільової кількості
@@ -527,7 +552,17 @@ class PromoService:
                     if self.create_promo_code(new_promo_code, amount):
                         new_codes.append(new_promo_code)
                         total_created += 1
-                        print(f"✅ [Smart] Промокод {new_promo_code} створено")
+                        log_info(f"✅ [Smart] Промокод {new_promo_code} створено")
+                        
+                        # Інкрементальне збереження - оновлюємо S3 одразу після створення коду
+                        try:
+                            temp_updated_codes = updated_codes.copy()
+                            temp_updated_codes[amount_key] = new_codes
+                            self.update_s3_codes(temp_updated_codes)
+                            log_verbose(f"💾 [Smart] Проміжне збереження: {len(new_codes)} кодів для суми {amount}")
+                        except Exception as save_error:
+                            log_error(f"⚠️ [Smart] Помилка проміжного збереження: {save_error}")
+                        
                         time.sleep(1)  # Затримка між створеннями
                     else:
                         print(f"❌ [Smart] Не вдалося створити код: {new_promo_code}")
@@ -536,19 +571,33 @@ class PromoService:
                     print(f"❌ [Smart] Помилка при створенні коду {i+1}/{codes_to_create}: {e}")
             
             updated_codes[amount_key] = new_codes
-            print(f"📊 [Smart] Для суми {amount}: було {len(active_codes)} активних, створено {codes_to_create}, тепер маємо {len(new_codes)}")
+            log_info(f"📊 [Smart] Для суми {amount}: було {len(active_codes)} активних, створено {codes_to_create}, тепер маємо {len(new_codes)}")
+            
+            # Очищаємо лічільник використаних кодів для цієї суми після успішної обробки
+            if codes_to_create > 0:  # Тільки якщо дійсно створили нові коди
+                if self.clear_used_codes_count(amount):
+                    log_info(f"🗑️ [Smart] Лічільник використаних кодів для суми {amount} очищено")
+                else:
+                    log_error(f"⚠️ [Smart] Не вдалося очистити лічільник для суми {amount}")
         
         # 4. Оновлюємо коди в S3 тільки для оброблених сум (зберігаючи інші суми)
         if self.update_s3_codes(updated_codes):
-            print(f"🎉 [Smart] Розумне поповнення завершено! Створено {total_created} нових кодів")
+            log_info(f"🎉 [Smart] Розумне поповнення завершено! Створено {total_created} нових кодів")
             
-            # Виводимо підсумок по кожній сумі
+            # Виводимо підсумок по кожній сумі та очищаємо лічільники
             for amount_str, codes_list in updated_codes.items():
-                print(f"💰 [Smart] Сума {amount_str}: {len(codes_list)} активних кодів оновлено в S3")
+                amount = int(amount_str)
+                log_info(f"💰 [Smart] Сума {amount}: {len(codes_list)} активних кодів оновлено в S3")
+                
+                # Очищаємо лічільник використаних кодів для цієї суми
+                if self.clear_used_codes_count(amount):
+                    log_info(f"🗑️ [Smart] Лічільник використаних кодів для суми {amount} очищено")
+                else:
+                    log_error(f"⚠️ [Smart] Не вдалося очистити лічільник для суми {amount}")
             
             return True
         else:
-            print("❌ [Smart] Не вдалося оновити коди в S3")
+            log_error("❌ [Smart] Не вдалося оновити коди в S3")
             return False
 
     def create_promo_code(self, promo_code, amount):

@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Переходимо в кореневу директорію проєкту
-cd "$(dirname "$0")/../.." || exit
+# Переходимо в директорію проєкту (parent directory від scripts)
+cd "$(dirname "$0")/.." || exit
 
 set -e
 
@@ -26,8 +26,8 @@ log_error() {
 
 # --- Конфігурація ---
 AWS_REGION="eu-north-1"
-FUNCTION_NAME="replenish-promo-code" # Нова назва для повільної функції
-ECR_REPO_NAME="replenish-promo-code-repo" # Нова назва репозиторію
+FUNCTION_NAME="bonus-replenish-promo-prod" # Правильна назва функції
+ECR_REPO_NAME="bonus-replenish-promo" # Назва ECR репозиторію
 LAMBDA_ROLE_NAME="lambda-promo-role"
 
 # Функція для очікування, поки Lambda функція стане активною
@@ -82,7 +82,7 @@ log_success "Docker автентифіковано."
 
 # --- Крок 3: Build, Tag, Push Docker образу ---
 log_info "Збираємо Docker образ для архітектури amd64..."
-docker build --platform linux/amd64 -t "$ECR_REPO_NAME:latest" -f replenish_promo_code_lambda/Dockerfile ./replenish_promo_code_lambda
+docker build --platform linux/amd64 -t "$ECR_REPO_NAME:latest" .
 log_success "Образ зібрано."
 
 log_info "Тегуємо образ..."
@@ -111,9 +111,9 @@ if ! aws lambda get-function --function-name "$FUNCTION_NAME" --region "$AWS_REG
         --package-type Image \
         --code ImageUri="$IMAGE_URI" \
         --role "$ROLE_ARN" \
-        --timeout 120 \
-        --memory-size 2048 \
-        --environment "Variables={SESSION_S3_BUCKET=lambda-promo-sessions,ADMIN_URL=https://safeyourlove.com/edit/discounts/codes,ADMIN_USERNAME=owner,ADMIN_PASSWORD=sdjkdfsf4ir2rfkb,PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers,LOG_LEVEL=INFO}" >/dev/null
+        --timeout 900 \
+        --memory-size 3008 \
+        --environment "Variables={SESSION_S3_BUCKET=lambda-promo-sessions,ADMIN_URL=https://safeyourlove.com/edit/discounts/codes,ADMIN_USERNAME=owner,ADMIN_PASSWORD=sdjkdfsf4ir2rfkb,PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers,LOG_LEVEL=WARNING,VERBOSE_LOGGING=false}" >/dev/null
     log_success "Lambda функцію '$FUNCTION_NAME' створено."
 else
     log_info "Функція знайдена. Оновлюємо код..."
@@ -130,9 +130,9 @@ else
         --function-name "$FUNCTION_NAME" \
         --region "$AWS_REGION" \
         --role "$ROLE_ARN" \
-        --timeout 120 \
-        --memory-size 2048 \
-        --environment "Variables={SESSION_S3_BUCKET=lambda-promo-sessions,ADMIN_URL=https://safeyourlove.com/edit/discounts/codes,ADMIN_USERNAME=owner,ADMIN_PASSWORD=sdjkdfsf4ir2rfkb,PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers,LOG_LEVEL=INFO}" >/dev/null
+        --timeout 900 \
+        --memory-size 3008 \
+        --environment "Variables={SESSION_S3_BUCKET=lambda-promo-sessions,ADMIN_URL=https://safeyourlove.com/edit/discounts/codes,ADMIN_USERNAME=owner,ADMIN_PASSWORD=sdjkdfsf4ir2rfkb,PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers,LOG_LEVEL=WARNING,VERBOSE_LOGGING=false}" >/dev/null
     log_success "Конфігурацію Lambda функції оновлено."
 fi
 

@@ -10,10 +10,10 @@
     "description": "enabled: увімкнути пошук клієнтів, only_search: тільки пошук без нарахування, min_bonus_amount: мінімальна кількість бонусів для пошуку"
   },
   "proxy": {
-    "enabled": true,
+    "enabled": false,
     "host": "p.webshare.io",
     "port": 80,
-    "username": "oxfvxmgn-UA-rotate",
-    "password": "drciz7b4squj"
+    "username": "YOUR_NEW_USERNAME_HERE",
+    "password": "YOUR_NEW_PASSWORD_HERE"
   }
 }

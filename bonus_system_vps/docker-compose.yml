@@ -1,0 +1,80 @@
+services:
+  # Nginx reverse proxy з SSL
+  nginx:
+    image: nginx:alpine
+    container_name: bonus-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./certbot/www:/var/www/certbot:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+    depends_on:
+      - api
+    networks:
+      - bonus-network
+
+  # FastAPI додаток
+  api:
+    build: .
+    container_name: bonus-api
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://bonus:${DB_PASSWORD:-bonuspass123}@db:5432/bonus_db
+      - KEYCRM_API_TOKEN=${KEYCRM_API_TOKEN}
+      - ADMIN_URL=${ADMIN_URL}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - DEBUG=${DEBUG:-false}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - playwright-data:/home/appuser/.cache/ms-playwright
+    networks:
+      - bonus-network
+
+  # PostgreSQL база даних
+  db:
+    image: postgres:15-alpine
+    container_name: bonus-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=bonus
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-bonuspass123}
+      - POSTGRES_DB=bonus_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bonus -d bonus_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bonus-network
+
+  # Certbot для SSL сертифікатів (опціонально)
+  certbot:
+    image: certbot/certbot
+    container_name: bonus-certbot
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+volumes:
+  postgres-data:
+    name: bonus-postgres-data
+  playwright-data:
+    name: bonus-playwright-data
+
+networks:
+  bonus-network:
+    name: bonus-network
+    driver: bridge
+

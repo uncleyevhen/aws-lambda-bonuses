@@ -2,7 +2,8 @@
 
 # Запуск Lambda функції з real-time логами
 
-FUNCTION_NAME="replenish-promo-code"
+FUNCTION_NAME="bonus-replenish-promo-prod"
+AWS_REGION="eu-north-1"
 
 echo "🚀 Запуск Lambda функції: $FUNCTION_NAME"
 echo "⏰ $(date)"
@@ -13,7 +14,8 @@ echo "📡 Викликаємо функцію..."
 
 aws lambda invoke \
     --function-name "$FUNCTION_NAME" \
-    --payload '{}' \
+    --region "$AWS_REGION" \
+    --payload file://invoke_payload.json \
     --cli-binary-format raw-in-base64-out \
     --log-type Tail \
     response.json > invoke_output.json

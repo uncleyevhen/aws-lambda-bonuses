@@ -131,12 +131,35 @@ dmypy.json
 # AWS Lambda specific
 *.zip
 response.json
+response*.json
+*_response.json
+*_payload.json
+*_trigger.json
+
+# Temporary test files
+test_*.json
+temp_*.json
+*_test_data.json
+*.b64.txt
+lock_status*.txt
 
 # Screenshots and temporary files
 /tmp/
 *.png
 *.jpg
 *.jpeg
+
+# Archives
+*.tar.gz
+*.tar
+*.gz
+
+# Scraper results (with timestamps)
+redirect_scraper/redirects_*.csv
+redirect_scraper/redirects_*.json
+
+# Downloaded scripts
+get-docker.sh
 
 # Docker
 .dockerignore

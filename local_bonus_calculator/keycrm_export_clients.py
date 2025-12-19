@@ -535,11 +535,11 @@ def load_config():
         return {
             "api_key": "M2IyOTFjNWM4ODA2OWU0NjU4ZDRkODAxZDVkMTQ4ZGNlMzUzYzc5NQ",
             "proxy": {
-                "enabled": True,
+                "enabled": False,
                 "host": "p.webshare.io",
                 "port": 80,
-                "username": "oxfwmgn-UA-rotate",
-                "password": "drci27S4eayj"
+                "username": "YOUR_NEW_USERNAME_HERE",
+                "password": "YOUR_NEW_PASSWORD_HERE"
             }
         }
 

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM public.ecr.aws/lambda/python:3.13
 
-# Встановлюємо системні залежності для Chromium, які рідко змінюються
+# Встановлюємо системні залежності для Chromium та інструменти збірки, які рідко змінюються
 # Використовуємо microdnf, оскільки базовий образ - Amazon Linux
 RUN microdnf install -y \
     mesa-libGL \
@@ -26,7 +26,10 @@ RUN microdnf install -y \
     libxshmfence \
     mesa-libgbm \
     nss \
-    xorg-x11-server-Xvfb
+    xorg-x11-server-Xvfb \
+    gcc \
+    gcc-c++ \
+    make
 
 # Встановлюємо робочу директорію
 WORKDIR ${LAMBDA_TASK_ROOT}

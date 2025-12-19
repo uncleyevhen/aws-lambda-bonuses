@@ -722,11 +722,11 @@ def load_config():
                 "min_bonus_amount": 3000
             },
             "proxy": {
-                "enabled": True,
+                "enabled": False,
                 "host": "p.webshare.io",
                 "port": 80,
-                "username": "oxfwmgn-UA-rotate",
-                "password": "drci27S4eayj"
+                "username": "YOUR_NEW_USERNAME_HERE",
+                "password": "YOUR_NEW_PASSWORD_HERE"
             }
         }
 

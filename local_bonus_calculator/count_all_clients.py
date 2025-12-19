@@ -15,8 +15,8 @@ def count_all_clients():
         "Content-Type": "application/json"
     }
     
-    # Проксі
-    proxy_url = "http://oxfwmgn-UA-rotate:drci27S4eayj@p.webshare.io:80"
+    # Проксі - ЗАМІНІТЬ НА ВАШІ НОВІ ДАНІ
+    proxy_url = "http://YOUR_NEW_USERNAME:YOUR_NEW_PASSWORD@p.webshare.io:80"
     proxies = {
         'http': proxy_url,
         'https': proxy_url
