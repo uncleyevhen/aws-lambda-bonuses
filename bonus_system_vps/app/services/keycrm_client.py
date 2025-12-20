@@ -118,18 +118,94 @@ class KeyCRMClient:
         
         return result
     
-    async def update_bonus_history(self, buyer_id: int, history: str) -> Dict[str, Any]:
-        """Оновлює історію бонусів покупця"""
+    async def get_buyer_history(self, buyer_id: int) -> str:
+        """Отримує поточну історію бонусів покупця з KeyCRM"""
+        result = await self.get_buyer(buyer_id)
+        
+        if result["success"] and result.get("data"):
+            buyer_data = result["data"]
+            custom_fields = buyer_data.get("custom_fields", [])
+            
+            for field in custom_fields:
+                if field.get("uuid") == settings.history_field_uuid:
+                    return field.get("value") or ""
+        
+        return ""
+    
+    async def update_bonus_history(self, buyer_id: int, new_history: str, append_to_existing: bool = True) -> Dict[str, Any]:
+        """
+        Оновлює історію бонусів покупця.
+        
+        Args:
+            buyer_id: ID покупця в KeyCRM
+            new_history: Нові записи історії (найновіші зверху)
+            append_to_existing: Якщо True - додає нові записи до існуючої історії
+                               Якщо False - повністю замінює історію
+        """
+        final_history = new_history
+        
+        if append_to_existing:
+            # Отримуємо існуючу історію з CRM
+            existing_history = await self.get_buyer_history(buyer_id)
+            
+            if existing_history and existing_history.strip():
+                # Нові записи на початок, старі в кінець
+                # Але перевіряємо чи нові записи не дублюються в старій історії
+                final_history = self._merge_histories(new_history, existing_history)
+                logger.debug(f"Об'єднано історію для buyer {buyer_id}: нова={len(new_history)} + стара={len(existing_history)} = {len(final_history)}")
+        
         update_data = {
             "custom_fields": [
                 {
                     "uuid": settings.history_field_uuid,
-                    "value": history
+                    "value": final_history
                 }
             ]
         }
         
         return await self.make_request("PUT", f"/buyer/{buyer_id}", update_data)
+    
+    def _merge_histories(self, new_history: str, existing_history: str) -> str:
+        """
+        Об'єднує нову та існуючу історію, уникаючи дублікатів.
+        
+        Нові записи додаються на початок.
+        Старі записи, яких немає в нових, зберігаються в кінці.
+        """
+        if not new_history:
+            return existing_history
+        if not existing_history:
+            return new_history
+        
+        # Розбиваємо на окремі записи (роздільник - подвійний перенос рядка)
+        new_entries = [e.strip() for e in new_history.split("\n\n") if e.strip()]
+        existing_entries = [e.strip() for e in existing_history.split("\n\n") if e.strip()]
+        
+        # Створюємо набір "підписів" нових записів для швидкого пошуку дублікатів
+        # Підпис = перші 50 символів запису (дата + тип операції)
+        new_signatures = set()
+        for entry in new_entries:
+            # Витягуємо ключову частину (дата, номер замовлення, тип операції)
+            signature = entry[:80] if len(entry) >= 80 else entry
+            new_signatures.add(signature)
+        
+        # Додаємо старі записи, яких немає в нових
+        unique_old_entries = []
+        for entry in existing_entries:
+            signature = entry[:80] if len(entry) >= 80 else entry
+            if signature not in new_signatures:
+                unique_old_entries.append(entry)
+        
+        # Об'єднуємо: нові на початку, унікальні старі в кінці
+        all_entries = new_entries + unique_old_entries
+        
+        # Обмежуємо загальну кількість записів (щоб не перевищувати ліміт поля)
+        max_entries = 100
+        if len(all_entries) > max_entries:
+            all_entries = all_entries[:max_entries]
+            logger.warning(f"Історія обрізана до {max_entries} записів")
+        
+        return "\n\n".join(all_entries)
     
     async def sync_all_duplicates(
         self, 

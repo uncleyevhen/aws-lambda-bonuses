@@ -1,41 +1,35 @@
-import os
-import logging
-from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
-
 """
-BrowserManager - Менеджер браузера для Playwright з підтримкою headed/headless режимів
+BrowserManager - Менеджер браузера для Playwright з підтримкою headed/headless режимів.
+
+Standalone версія для використання в скриптах поза VPS системою.
 
 Режими запуску:
-1. HEADED (за замовчуванням) - для локального дебагу з видимим браузером
-2. HEADLESS - для продакшна/AWS Lambda
+1. HEADED (за замовчуванням для локального дебагу) - з видимим браузером
+2. HEADLESS - для продакшна/Docker
 
 Способи увімкнення HEADLESS режиму:
 
 1. Через змінну середовища:
    export PLAYWRIGHT_HEADED=false
-   python3 generate_promo_codes.py
-
-2. Через код (у promo_logic.py або скрипті):
+   
+2. Через код:
    browser_manager = create_browser_manager(headed_mode=False)
 
 3. Тимчасово в терміналі:
-   PLAYWRIGHT_HEADED=false python3 generate_promo_codes.py
-
-У HEADED режимі:
-- Браузер відкривається видимим
-- Збільшений viewport (1920x1080)
-- Збільшені тайм-аути (120 сек)
-- Slow motion для кращого спостереження
-- Мінімальні аргументи браузера
+   PLAYWRIGHT_HEADED=false python script.py
 """
 
-# Налаштування логування
+import os
+import logging
+from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
+
 logger = logging.getLogger(__name__)
+
 
 class BrowserManager:
     """
-    Менеджер для роботи з Playwright браузером в AWS Lambda.
-    Оптимізований для serverless середовища.
+    Менеджер для роботи з Playwright браузером.
+    Оптимізований для локального та серверного середовища.
     Підтримує як headless, так і headed режими для дебагу.
     """
     
@@ -50,12 +44,8 @@ class BrowserManager:
         if headed_mode is not None:
             self.headed_mode = headed_mode
         else:
-            # В AWS Lambda завжди headless режим
-            if os.getenv('AWS_LAMBDA_FUNCTION_NAME'):
-                self.headed_mode = False
-            else:
-                # Для локального режиму перевіряємо змінну середовища (за замовчуванням HEADED режим)
-                self.headed_mode = os.getenv('PLAYWRIGHT_HEADED', 'true').lower() in ['true', '1', 'yes']
+            # Для локального режиму перевіряємо змінну середовища (за замовчуванням HEADED режим)
+            self.headed_mode = os.getenv('PLAYWRIGHT_HEADED', 'true').lower() in ['true', '1', 'yes']
         
         logger.info(f"🎬 BrowserManager режим: {'HEADED (видимий)' if self.headed_mode else 'HEADLESS (фоновий)'}")
     
@@ -67,22 +57,6 @@ class BrowserManager:
             return self.page
         
         logger.info("🚀 Ініціалізуємо Playwright браузер...")
-        
-        # Діагностика середовища
-        playwright_browsers_path = os.getenv('PLAYWRIGHT_BROWSERS_PATH', '/opt/playwright-browsers')
-        logger.info(f"🔍 PLAYWRIGHT_BROWSERS_PATH: {playwright_browsers_path}")
-        
-        # Перевіряємо, чи існує директорія з браузерами
-        if os.path.exists(playwright_browsers_path):
-            logger.info(f"✅ Директорія браузерів знайдена: {playwright_browsers_path}")
-            # Виводимо що є в директорії
-            try:
-                contents = os.listdir(playwright_browsers_path)
-                logger.info(f"📂 Вміст директорії: {contents}")
-            except Exception as e:
-                logger.warning(f"⚠️ Не вдалося прочитати директорію: {e}")
-        else:
-            logger.error(f"❌ Директорія браузерів не знайдена: {playwright_browsers_path}")
         
         try:
             # Запуск Playwright
@@ -96,21 +70,18 @@ class BrowserManager:
                 logger.info("🖥️ Запуск у HEADED режимі для дебагу...")
                 browser_args = [
                     '--disable-blink-features=AutomationControlled',
-                    '--disable-web-security',  # Для доступу до різних доменів під час тестування
+                    '--disable-web-security',
                 ]
             else:
-                # Headless режим для продакшна (AWS Lambda)
+                # Headless режим для продакшна
                 logger.info("👻 Запуск у HEADLESS режимі для продакшна...")
                 browser_args = [
-                    # Основні аргументи для AWS Lambda
                     '--no-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-gpu',
                     '--disable-web-security',
                     '--disable-features=VizDisplayCompositor',
                     '--disable-blink-features=AutomationControlled',
-                    
-                    # Оптимізація для serverless
                     '--single-process',
                     '--no-zygote',
                     '--disable-setuid-sandbox',
@@ -118,72 +89,19 @@ class BrowserManager:
                     '--disable-renderer-backgrounding',
                     '--disable-backgrounding-occluded-windows',
                     '--disable-ipc-flooding-protection',
-                    
-                    # Зменшення використання пам'яті
                     '--memory-pressure-off',
-                    '--max_old_space_size=512',
-                    
-                    # Відключення непотрібних функцій
                     '--disable-extensions',
                     '--disable-default-apps',
                     '--disable-sync',
                     '--disable-translate',
                     '--disable-background-networking',
-                    '--disable-background-mode',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-component-update',
-                    '--disable-default-apps',
-                    '--disable-domain-reliability',
-                    '--disable-features=TranslateUI,BlinkGenPropertyTrees',
-                    '--disable-hang-monitor',
-                    '--disable-ipc-flooding-protection',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-renderer-backgrounding',
-                    '--disable-sync',
-                    '--disable-web-resources',
-                    '--disable-web-security',
-                    '--metrics-recording-only',
                     '--no-first-run',
-                    '--safebrowsing-disable-auto-update',
-                    '--use-mock-keychain',
-                    
-                    # Додаткові опції для AWS Lambda
-                    '--enable-logging',
-                    '--log-level=0',
-                    '--v=1',
-                    '--no-default-browser-check',
-                    '--disable-component-extensions-with-background-pages',
-                    '--disable-default-apps',
-                    '--disable-background-mode',
-                    '--disable-background-timer-throttling',
-                    '--disable-renderer-backgrounding',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-features=TranslateUI',
-                    '--disable-features=BlinkGenPropertyTrees',
-                    '--run-all-compositor-stages-before-draw',
-                    '--disable-threaded-animation',
-                    '--disable-threaded-scrolling',
-                    '--disable-checker-imaging',
-                    '--disable-new-content-rendering-timeout',
-                    '--disable-background-media-suspend',
-                    '--disable-partial-raster',
-                    '--disable-canvas-aa',
-                    '--disable-2d-canvas-clip-aa',
-                    '--disable-gl-drawing-for-tests',
-                    '--disable-canvas-aa',
-                    '--disable-3d-apis',
-                    '--disable-accelerated-2d-canvas',
-                    '--disable-accelerated-jpeg-decoding',
-                    '--disable-accelerated-mjpeg-decode',
-                    '--disable-app-list-dismiss-on-blur',
-                    '--disable-accelerated-video-decode',
                 ]
             
             self.browser = self.playwright.chromium.launch(
                 headless=not self.headed_mode,
                 args=browser_args,
-                slow_mo=50 if self.headed_mode else 0,  # Повільніший режим для дебагу
+                slow_mo=50 if self.headed_mode else 0,
             )
             
             # Створення контексту з оптимізованими налаштуваннями
@@ -205,7 +123,7 @@ class BrowserManager:
             self.page = self.context.new_page()
             
             # Встановлення тайм-аутів (більші для headed режиму)
-            timeout = 120000 if self.headed_mode else 60000  # 2 хвилини для дебагу, 1 хвилина для продакшна
+            timeout = 120000 if self.headed_mode else 60000
             self.page.set_default_timeout(timeout)
             self.page.set_default_navigation_timeout(timeout)
             
@@ -267,13 +185,14 @@ class BrowserManager:
         """Context manager exit"""
         self.cleanup()
 
-# Глобальний екземпляр для переuse в Lambda
+
+# Глобальний екземпляр для reuse
 _global_browser_manager = None
+
 
 def create_browser_manager(headed_mode=None) -> BrowserManager:
     """
     Створює або повертає глобальний екземпляр браузер менеджера.
-    Це оптимізує cold start в AWS Lambda.
     
     Args:
         headed_mode: True для видимого браузера (дебаг), False для headless, 
@@ -285,6 +204,7 @@ def create_browser_manager(headed_mode=None) -> BrowserManager:
         _global_browser_manager = BrowserManager(headed_mode=headed_mode)
     
     return _global_browser_manager
+
 
 def cleanup_global_browser():
     """

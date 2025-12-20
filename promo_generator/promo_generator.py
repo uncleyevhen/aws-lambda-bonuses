@@ -47,14 +47,14 @@ import multiprocessing
 from multiprocessing import Process, Queue
 from dotenv import load_dotenv
 
-# Додаємо шлях до replenish_promo_code_lambda для імпорту
+# Додаємо шлях до shared модулів для імпорту
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(parent_dir, 'replenish_promo_code_lambda'))
+sys.path.insert(0, parent_dir)
 
 # Імпорти для браузера та логіну (з обробкою помилок)
 try:
-    from bonus_system.bonus_replenish_promo_code.browser_manager import create_browser_manager
-    from bonus_system.bonus_replenish_promo_code.promo_logic import PromoService
+    from shared.browser_manager import create_browser_manager
+    from shared.promo_service import PromoService
     BROWSER_MODULES_AVAILABLE = True
 except ImportError as e:
     # Створюємо logger, якщо він ще не ініціалізований
@@ -253,8 +253,8 @@ def smart_promo_management_worker(process_id, config, process_logger):
         sys.path.insert(0, current_dir)
     
     try:
-        from bonus_system.bonus_replenish_promo_code.browser_manager import create_browser_manager
-        from bonus_system.bonus_replenish_promo_code.promo_logic import PromoService
+        from shared.browser_manager import create_browser_manager
+        from shared.promo_service import PromoService
         from promo_smart import PromoSmartManager
         
         # Імпортуємо функції з поточного модуля безпосередньо
