@@ -104,7 +104,11 @@ class BonusService:
         return client, created
     
     def get_balance(self, phone: str) -> Dict[str, Any]:
-        """Отримує баланс клієнта за телефоном"""
+        """
+        Отримує баланс клієнта за телефоном.
+        
+        Якщо бонуси прострочені (bonus_expiry < сьогодні) - повертає 0.
+        """
         client = self.get_client_by_phone(phone)
         
         if not client:
@@ -114,17 +118,29 @@ class BonusService:
                 "reserved_balance": 0,
                 "total_balance": 0,
                 "phone": normalize_phone(phone),
-                "found": False
+                "found": False,
+                "expired": False
             }
+        
+        # Перевіряємо чи бонуси не прострочені
+        is_expired = False
+        effective_bonus = client.bonus_balance
+        
+        if client.bonus_expiry and client.bonus_expiry < datetime.utcnow().date():
+            is_expired = True
+            effective_bonus = 0
+            logger.info(f"⏰ Бонуси для {phone} прострочені (expiry: {client.bonus_expiry})")
         
         return {
             "success": True,
-            "bonus_balance": client.bonus_balance,
+            "bonus_balance": effective_bonus,
             "reserved_balance": client.reserved_balance,
-            "total_balance": client.total_balance,
+            "total_balance": effective_bonus + client.reserved_balance,
             "bonus_expiry": client.bonus_expiry.isoformat() if client.bonus_expiry else None,
             "phone": client.phone,
-            "found": True
+            "found": True,
+            "expired": is_expired,
+            "actual_bonus_in_db": client.bonus_balance  # Реальне значення в БД (для дебагу)
         }
     
     # ==================== Операції з бонусами ====================
@@ -162,6 +178,13 @@ class BonusService:
         # Розраховуємо нові бонуси (10% від суми замовлення)
         new_bonus = int(order_total * settings.bonus_percentage)
         
+        # Перевіряємо чи бонуси прострочені - якщо так, скидаємо їх
+        expired_bonus = 0
+        if client.bonus_expiry and client.bonus_expiry < datetime.utcnow().date():
+            expired_bonus = client.bonus_balance
+            client.bonus_balance = 0
+            logger.info(f"🔥 Згоріло {expired_bonus} прострочених бонусів для клієнта {client.phone}")
+        
         # Оновлюємо баланси
         client.reserved_balance = max(0, client.reserved_balance - reserved_for_order)
         client.bonus_balance += new_bonus
@@ -179,7 +202,8 @@ class BonusService:
             reserved_before=reserved_before,
             reserved_after=client.reserved_balance,
             keycrm_buyer_id=client_id,
-            description=f"Виконано замовлення #{order_id}, списано резерв {reserved_for_order}, нараховано {new_bonus}"
+            description=f"Виконано замовлення #{order_id}, списано резерв {reserved_for_order}, нараховано {new_bonus}" + 
+                       (f", згоріло прострочених {expired_bonus}" if expired_bonus > 0 else "")
         )
         self.db.add(transaction)
         self.db.commit()
@@ -206,7 +230,8 @@ class BonusService:
             "previous_reserved": reserved_before,
             "new_reserved": client.reserved_balance,
             "accrued_bonus": new_bonus,
-            "used_bonus": reserved_for_order
+            "used_bonus": reserved_for_order,
+            "expired_bonus": expired_bonus
         }
     
     async def handle_order_reservation(self, webhook_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -238,6 +263,15 @@ class BonusService:
             return {"success": False, "error": f"Не вдалося отримати телефон"}
         
         client, _ = self.get_or_create_client(phone, keycrm_id=client_id)
+        
+        # Перевіряємо чи бонуси не прострочені
+        if client.bonus_expiry and client.bonus_expiry < datetime.utcnow().date():
+            logger.warning(f"⏰ Спроба резервування прострочених бонусів для {phone} (expiry: {client.bonus_expiry})")
+            return {
+                "success": False, 
+                "error": "Бонуси прострочені",
+                "bonus_expiry": client.bonus_expiry.isoformat()
+            }
         
         # Розраховуємо суму для резервування
         bonus_to_reserve = min(int(discount_amount), client.bonus_balance)
@@ -322,10 +356,21 @@ class BonusService:
         balance_before = client.bonus_balance
         reserved_before = client.reserved_balance
         
-        # Повертаємо бонуси
+        # Перевіряємо чи бонуси прострочені - якщо так, скидаємо їх
+        expired_bonus = 0
+        if client.bonus_expiry and client.bonus_expiry < datetime.utcnow().date():
+            expired_bonus = client.bonus_balance
+            client.bonus_balance = 0
+            logger.info(f"🔥 Згоріло {expired_bonus} прострочених бонусів для клієнта {client.phone}")
+        
+        # Повертаємо бонуси з резерву
         return_amount = min(reserved_for_order, client.reserved_balance)
         client.bonus_balance += return_amount
         client.reserved_balance -= return_amount
+        
+        # Оновлюємо дату закінчення якщо є повернені бонуси
+        if return_amount > 0:
+            client.bonus_expiry = datetime.utcnow().date() + timedelta(days=settings.bonus_expiry_days)
         
         # Записуємо транзакцію
         transaction = BonusTransaction(
@@ -338,7 +383,8 @@ class BonusService:
             reserved_before=reserved_before,
             reserved_after=client.reserved_balance,
             keycrm_buyer_id=client_id,
-            description=f"Скасовано замовлення #{order_id}, повернуто {return_amount}"
+            description=f"Скасовано замовлення #{order_id}, повернуто {return_amount}" +
+                       (f", згоріло прострочених {expired_bonus}" if expired_bonus > 0 else "")
         )
         self.db.add(transaction)
         self.db.commit()
@@ -362,7 +408,8 @@ class BonusService:
             "returned_bonus": return_amount,
             "previous_bonus": balance_before,
             "new_bonus": client.bonus_balance,
-            "new_reserved": client.reserved_balance
+            "new_reserved": client.reserved_balance,
+            "expired_bonus": expired_bonus
         }
     
     async def handle_lead_bonus_reservation(self, webhook_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -413,6 +460,15 @@ class BonusService:
             return {"success": False, "error": f"Не вдалося отримати телефон"}
         
         client, _ = self.get_or_create_client(phone, keycrm_id=contact_id)
+        
+        # Перевіряємо чи бонуси не прострочені
+        if client.bonus_expiry and client.bonus_expiry < datetime.utcnow().date():
+            logger.warning(f"⏰ Спроба резервування прострочених бонусів через лід для {phone}")
+            return {
+                "success": False,
+                "error": "Бонуси прострочені",
+                "bonus_expiry": client.bonus_expiry.isoformat()
+            }
         
         # Перевіряємо чи вже є резервування для цього замовлення
         existing_reserve = self._find_reserved_for_order(client.id, str(order_id))

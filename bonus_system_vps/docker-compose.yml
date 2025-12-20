@@ -35,6 +35,7 @@ services:
         condition: service_healthy
     volumes:
       - playwright-data:/home/appuser/.cache/ms-playwright
+      - ./logs:/app/logs
     networks:
       - bonus-network
 

@@ -2,6 +2,8 @@
 Головний файл FastAPI додатку бонусної системи.
 """
 import logging
+import os
+from logging.handlers import TimedRotatingFileHandler
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,10 +12,24 @@ from app.config import settings
 from app.database import engine, Base
 from app.routers import webhooks, balance, promo, migration
 
-# Налаштування логування
+# Створюємо папку для логів
+LOG_DIR = "/app/logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Налаштування логування з ротацією на 7 днів
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        TimedRotatingFileHandler(
+            filename=os.path.join(LOG_DIR, "bonus-api.log"),
+            when="midnight",
+            interval=1,
+            backupCount=7,  # Зберігати логи за останні 7 днів
+            encoding='utf-8'
+        )
+    ]
 )
 logger = logging.getLogger(__name__)
 

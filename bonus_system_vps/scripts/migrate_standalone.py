@@ -473,10 +473,6 @@ class KeyCRMMigrator:
             try:
                 merged_data = self.merge_duplicates(group_buyers)
                 
-                # Пропускаємо клієнтів без бонусів
-                if merged_data["bonus_balance"] == 0 and merged_data["reserved_balance"] == 0:
-                    continue
-                
                 client = {
                     "phone": phone,
                     "bonus_balance": merged_data["bonus_balance"],
@@ -488,7 +484,9 @@ class KeyCRMMigrator:
                 }
                 clients_to_create.append(client)
                 
-                self.stats["clients_with_bonus"] += 1
+                # Рахуємо статистику
+                if merged_data["bonus_balance"] > 0 or merged_data["reserved_balance"] > 0:
+                    self.stats["clients_with_bonus"] += 1
                 self.stats["total_bonus_amount"] += merged_data["bonus_balance"]
                 
                 if len(group_buyers) > 1:
@@ -498,7 +496,7 @@ class KeyCRMMigrator:
                 logger.error(f"❌ Помилка для телефону {phone}: {e}")
                 self.stats["errors"] += 1
         
-        logger.info(f"✅ Підготовлено {len(clients_to_create)} клієнтів з бонусами")
+        logger.info(f"✅ Підготовлено {len(clients_to_create)} клієнтів (з бонусами: {self.stats['clients_with_bonus']})")
         
         # 4. Зберігаємо в JSON для перевірки
         self.save_to_json(clients_to_create, "migration_data.json")

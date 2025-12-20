@@ -46,7 +46,9 @@ RUN playwright install chromium
 
 # Повертаємось до root для chown
 USER root
-RUN chown -R appuser:appuser /app
+
+# Створюємо папку для логів з правильними правами
+RUN mkdir -p /app/logs && chown -R appuser:appuser /app
 
 # Запуск як appuser
 USER appuser
